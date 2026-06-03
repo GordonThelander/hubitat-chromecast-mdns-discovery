@@ -7,14 +7,14 @@ The hub IP is detected dynamically from the Hubitat runtime.
 
 ## What it does
 
-- Sends a short Google Cast mDNS probe to stimulate device responses.
+- Sends Google Cast mDNS pulses to stimulate device responses.
 - Waits briefly for Hubitat's internal mDNS cache to update.
 - Reads Hubitat's internal mDNS JSON endpoint.
 - Parses `_googlecast._tcp.local` endpoints from `http://<hub-ip>:8080/hub/mdnsDevices/json`.
 - Displays clean resolved Chromecast / Google Cast devices.
 - Shows progress and expected-device coverage.
 - Provides diagnostics for parsed mDNS sections and raw cached records.
-- Does not require a hardcoded hub IP address.
+- Moves non-responsive device records to an achive table for 7 days, then permanntly deletes them.
 
 ## What it does not do
 
@@ -22,7 +22,6 @@ The hub IP is detected dynamically from the Hubitat runtime.
 - It does not control Chromecast devices.
 - It does not send media, TTS, play, pause, volume, or app-launch commands.
 - It does not parse raw UDP replies for the final device list.
-- It does not require a browser bookmarklet or manual JSON paste.
 - It does not replace Hubitat's native Chromecast Integration.
 
 ## Discovery flow

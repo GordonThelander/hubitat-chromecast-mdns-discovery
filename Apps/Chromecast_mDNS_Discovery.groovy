@@ -1,329 +1,176 @@
 /**
  *  Chromecast mDNS Discovery
  *
- *  Version: 1.0.1
+ *  Version: 1.0.2
  *  Author: Gordon Thelander
- *  Purpose: 
+ *  Platform: Hubitat Elevation
+ *
+ *  Purpose:
  *  Discovery-style Hubitat app for Google Cast / Chromecast devices.
  *
- *  It uses a hybrid pattern:
- *
- *  1. Send a short mDNS probe to stimulate responses.
- *  2. Wait briefly for Hubitat's own mDNS cache to update.
- *  3. Read Hubitat's internal mDNS cache endpoint:
- *
- *  - Run discovery button
- *  - Discovery scan progress
- *  - Device coverage progress
- *  - Clean resolved devices
- *  - Optional diagnostics
- *
- *  What it does:
- *  - Sends an optional short Google Cast mDNS probe.
- *  - Reads Hubitat's mDNS registry/cache.
- *  - Parses _googlecast._tcp.local endpoints.
- *  - Shows the result as a clean discovery scan.
- *  - Accumulates the current discovered device list in app state.
- *
- *  What it does not do:
- *  - It does not create child devices.
- *  - It does not control Chromecast devices.
- *  - It does not parse raw multicast replies for the device list.
+ *  Design goals:
+ *  - Dynamically detect the Hubitat hub IP address.
+ *  - mDNS multicast probe packet pulses to 224.0.0.251:5353 to attempt to wake dormant decices 
+ *  - Read Hubitat's own mDNS cache from /hub/mdnsDevices and /hub/mdnsDevices/json.
+ *  - Prefer JSON when available, but fall back to parsing the HTML table shown by Hubitat.
+ *  - Display only clean Google Cast / Chromecast records with friendly name, IP and port.
+ *  - Keep a short history of previously discovered devices without polluting the current list.
+ *  - Does not create child devices and does not control Chromecast devices.
  */
 
 import groovy.json.JsonSlurper
+import groovy.transform.Field
+
+@Field static final String APP_VERSION = '2.0.4'
+@Field static final String GOOGLECAST_SERVICE = '_googlecast._tcp.local'
+@Field static final String GOOGLEZONE_SERVICE = '_googlezone._tcp.local'
+@Field static final String SERVICES_SERVICE = '_services._dns-sd._udp.local'
 
 definition(
-    name: "Chromecast mDNS Discovery",
-    namespace: "gordon-thelander",
-    author: "Gordon Thelander",
-    description: "Discovery-style Google Cast / Chromecast inventory using a short mDNS probe followed by Hubitat's internal mDNS cache. Does not create child devices.",
-    category: "Convenience",
-    iconUrl: "",
-    iconX2Url: "",
+    name: 'Chromecast mDNS Discovery',
+    namespace: 'gordon-thelander',
+    author: 'Gordon Thelander',
+    description: 'Discovery-only Google Cast / Chromecast inventory using Hubitat mDNS cache. No child devices are created.',
+    category: 'Convenience',
+    iconUrl: '',
+    iconX2Url: '',
     singleInstance: true,
-    importUrl: ""
+    importUrl: ''
 )
 
 preferences {
-    page(name: "mainPage")
-    page(name: "discoveryPage")
-    page(name: "diagnosticsPage")
+    page(name: 'mainPage')
+    page(name: 'diagnosticsPage')
 }
 
 def installed() {
-    log.info "${app.name} installed"
+    log.info "${app.name} ${APP_VERSION} installed"
     initialise()
 }
 
 def updated() {
-    log.info "${app.name} updated"
+    log.info "${app.name} ${APP_VERSION} updated"
     unsubscribe()
     unschedule()
     initialise()
 }
 
 def initialise() {
-    state.discoveredDevices = state.discoveredDevices ?: [:]
-    state.discoveryHistory = state.discoveryHistory ?: [:]
-    state.mdnsSections = state.mdnsSections ?: []
-    state.discoveryRunning = false
-    state.scanTotal = state.scanTotal ?: 0
-    state.scanCompleted = state.scanCompleted ?: 0
-    state.discoveryStartedAt = state.discoveryStartedAt ?: null
-    state.discoveryCompletedAt = state.discoveryCompletedAt ?: null
-    state.lastDiscoveryMessage = state.lastDiscoveryMessage ?: null
-    state.lastError = state.lastError ?: null
+    state.currentDevices = state.currentDevices instanceof Map ? state.currentDevices : [:]
+    state.deviceHistory = state.deviceHistory instanceof Map ? state.deviceHistory : [:]
+    state.mdnsSections = state.mdnsSections instanceof List ? state.mdnsSections : []
+    state.rawSample = state.rawSample ?: null
+    state.lastRunAt = state.lastRunAt ?: null
+    state.lastSuccessAt = state.lastSuccessAt ?: null
     state.lastWorkingUrl = state.lastWorkingUrl ?: null
-    state.rawJsonSample = state.rawJsonSample ?: null
-
-    unschedule()
+    state.lastMessage = state.lastMessage ?: 'Discovery has not run yet.'
+    state.lastError = state.lastError ?: null
+    state.lastHubIp = state.lastHubIp ?: null
 
     if (autoRefreshMinutes && safeInt(autoRefreshMinutes) > 0) {
-        Integer mins = Math.max(1, Math.min(60, safeInt(autoRefreshMinutes)))
-        schedule("0 */${mins} * ? * *", "backgroundRefreshDiscovery")
+        Integer mins = clampInt(safeInt(autoRefreshMinutes), 1, 60)
+        schedule("0 */${mins} * ? * *", 'scheduledDiscovery')
     }
 
-    if (logEnable) {
-        runIn(1800, "disableDebugLogging")
+    if (logEnable == true) {
+        runIn(1800, 'disableDebugLogging')
     }
 }
 
 def disableDebugLogging() {
-    app.updateSetting("logEnable", [value: "false", type: "bool"])
-    log.info "Debug logging disabled automatically"
+    app.updateSetting('logEnable', [value: 'false', type: 'bool'])
+    log.info 'Debug logging disabled automatically'
 }
 
 def mainPage() {
-    return dynamicPage(name: "mainPage", title: "Chromecast mDNS Discovery", install: true, uninstall: true) {
-        section("Discovery-only mode") {
-            paragraph "<b>Purpose:</b> Google Cast / Chromecast discovery only. This app does not create child devices and does not control Chromecast devices."
-            paragraph "<b>Method:</b> reads Hubitat's internal mDNS device cache and presents it as a clean discovery scan. This avoids unreliable raw multicast discovery from custom Groovy."
+    return dynamicPage(name: 'mainPage', title: 'Chromecast mDNS Discovery', install: true, uninstall: true) {
+        section('Purpose') {
+            paragraph "<b>Version:</b> ${APP_VERSION}<br><b>Mode:</b> Discovery only. This app reads Hubitat's mDNS cache and lists Google Cast / Chromecast records. It does not create devices."
         }
 
-        section("mDNS discovery configuration") {
-            input(
-                name: "discoveryRefreshSeconds",
-                type: "number",
-                title: "Discovery page refresh interval, seconds",
-                defaultValue: 1,
-                required: true,
-                submitOnChange: true
-            )
-
-            input(
-                name: "expectedCleanDeviceCount",
-                type: "number",
-                title: "Expected number of Chromecast devices",
-                description: "Used for coverage display. Set to 0 to disable.",
-                defaultValue: 15,
-                required: true,
-                submitOnChange: true
-            )
-
-            input(
-                name: "staleAfterMinutes",
-                type: "number",
-                title: "Mark mDNS record stale after minutes",
-                description: "Default 120. Uses Hubitat's Last updated timestamp.",
-                defaultValue: 120,
-                required: true,
-                submitOnChange: true
-            )
-
-            input(
-                name: "enablePreScanMdnsProbe",
-                type: "bool",
-                title: "Send mDNS probe before reading Hubitat cache?",
-                description: "Recommended on. Sends a short Google Cast mDNS probe, waits briefly, then reads /hub/mdnsDevices/json.",
-                defaultValue: true,
-                required: true,
-                submitOnChange: true
-            )
-
-            input(
-                name: "preScanProbeBursts",
-                type: "number",
-                title: "Pre-scan mDNS probe bursts",
-                description: "Default 2 for a ~5 second scan. This is only to stimulate Hubitat's own mDNS cache, not to parse raw replies.",
-                defaultValue: 2,
-                required: true,
-                submitOnChange: true
-            )
-
-            input(
-                name: "preScanPauseMs",
-                type: "number",
-                title: "Pause between pre-scan bursts, milliseconds",
-                defaultValue: 500,
-                required: true,
-                submitOnChange: true
-            )
-
-            input(
-                name: "preScanLateWaitMs",
-                type: "number",
-                title: "Wait after pre-scan before reading cache, milliseconds",
-                defaultValue: 1000,
-                required: true,
-                submitOnChange: true
-            )
-
-            input(
-                name: "autoRefreshMinutes",
-                type: "number",
-                title: "Background refresh interval, minutes",
-                description: "0 disables automatic background refresh.",
-                defaultValue: 0,
-                required: true,
-                submitOnChange: true
-            )
-
-            input(
-                name: "showUnresolvedMdnsRecords",
-                type: "bool",
-                title: "Show non-Chromecast mDNS records in diagnostics?",
-                description: "Shows Hue/Matter/other service records retained from Hubitat's mDNS cache.",
-                defaultValue: false,
-                required: true,
-                submitOnChange: true
-            )
-
+        section('Configuration') {
+            input name: 'preferJsonEndpoint', type: 'bool', title: 'Prefer /hub/mdnsDevices/json first?', defaultValue: true, required: true, submitOnChange: true
+            input name: 'sendProbeBeforeRead', type: 'bool', title: 'Send short mDNS probe before reading cache?', defaultValue: true, required: true, submitOnChange: true
+            input name: 'probeBursts', type: 'number', title: 'mDNS probe bursts', description: 'Default 2. Increase only if discovery is unreliable.', defaultValue: 2, required: true, submitOnChange: true
+            input name: 'settleDelayMs', type: 'number', title: 'Reserved - no blocking wait used by this version', defaultValue: 0, required: true, submitOnChange: true
+            input name: 'previousRetentionDays', type: 'number', title: 'Keep previously discovered devices for days', defaultValue: 7, required: true, submitOnChange: true
+            input name: 'autoRefreshMinutes', type: 'number', title: 'Background refresh interval, minutes', description: '0 disables scheduled refresh.', defaultValue: 0, required: true, submitOnChange: true
         }
 
-        section("Discovery") {
-            href(
-                name: "goDiscovery",
-                page: "discoveryPage",
-                title: "<b>Open Discovery Page</b>",
-                description: getDiscoverySummaryText()
-            )
+        section('Optional Chromecast wake shim') {
+            input name: 'wakeBeforeDiscovery', type: 'bool', title: 'Wake selected Chromecast child devices before discovery?', defaultValue: false, required: true, submitOnChange: true
+            input name: 'chromecastWakeDevices', type: 'capability.speechSynthesis', title: 'Chromecast child devices to wake', description: 'Optional. Sends speak(" ") to selected existing Chromecast Integration child devices.', multiple: true, required: false, submitOnChange: true
+            input name: 'wakeDelayMs', type: 'number', title: 'Reserved - no blocking wait used by this version', defaultValue: 0, required: true, submitOnChange: true
         }
 
-        section("Diagnostics") {
-            input(
-                name: "storeRawJsonSample",
-                type: "bool",
-                title: "Store raw mDNS cache sample for diagnostics?",
-                defaultValue: true,
-                required: true,
-                submitOnChange: true
-            )
-
-            input(
-                name: "logEnable",
-                type: "bool",
-                title: "Enable debug logging for 30 minutes?",
-                defaultValue: false,
-                required: true,
-                submitOnChange: true
-            )
-
-            input(
-                name: "descriptionTextEnable",
-                type: "bool",
-                title: "Enable description text logging?",
-                defaultValue: true,
-                required: true,
-                submitOnChange: true
-            )
-
-            href(
-                name: "goDiagnostics",
-                page: "diagnosticsPage",
-                title: "Open diagnostics",
-                description: "Raw mDNS cache sections, dynamically detected hub IP and parser status"
-            )
-        }
-    }
-}
-
-def discoveryPage() {
-    return dynamicPage(
-        name: "discoveryPage",
-        title: "Chromecast mDNS Discovery",
-        nextPage: "mainPage",
-        install: false,
-        refreshInterval: getDiscoveryRefreshSeconds()
-    ) {
-        section("Discovery controls") {
-            paragraph buildDiscoveryStatusHtml()
-
-            input(
-                name: "mdnsDiscoverBtn",
-                type: "button",
-                title: "Run Chromecast discovery",
-                submitOnChange: true
-            )
-
-            input(
-                name: "clearDiscoveredBtn",
-                type: "button",
-                title: "Clear/reset accumulated discovery list",
-                submitOnChange: true
-            )
+        section('Controls') {
+            input name: 'runDiscoveryBtn', type: 'button', title: 'Run Chromecast discovery', submitOnChange: true
+            input name: 'clearCurrentBtn', type: 'button', title: 'Clear current results', submitOnChange: true
+            input name: 'clearAllBtn', type: 'button', title: 'Clear all results and history', submitOnChange: true
         }
 
-        section("Clean resolved devices") {
-            paragraph buildDiscoveredDevicesHtml()
+        section('Discovery status') {
+            paragraph buildStatusHtml()
         }
 
-        section("Navigation") {
-            href(
-                name: "backToMain",
-                page: "mainPage",
-                title: "Back to main settings",
-                description: "Return to the main app page"
-            )
+        section('Clean resolved Chromecast devices') {
+            paragraph buildDeviceTableHtml()
+        }
+
+        section('Diagnostics') {
+            input name: 'storeRawSample', type: 'bool', title: 'Store raw endpoint sample?', defaultValue: true, required: true, submitOnChange: true
+            input name: 'showRawSections', type: 'bool', title: 'Show mDNS service section summary?', defaultValue: false, required: true, submitOnChange: true
+            input name: 'logEnable', type: 'bool', title: 'Enable debug logging for 30 minutes?', defaultValue: false, required: true, submitOnChange: true
+            href name: 'diagnosticsHref', page: 'diagnosticsPage', title: 'Open diagnostics', description: 'Endpoint source, parse summary and raw sample.'
         }
     }
 }
 
 def diagnosticsPage() {
-    return dynamicPage(
-        name: "diagnosticsPage",
-        title: "Chromecast mDNS Discovery Diagnostics",
-        nextPage: "mainPage",
-        install: false
-    ) {
-        section("Discovery status") {
-            paragraph "<pre style='white-space:pre-wrap;font-size:11px;'>${htmlEncode(state.lastDiscoveryMessage ?: '')}</pre>"
+    return dynamicPage(name: 'diagnosticsPage', title: 'Chromecast mDNS Discovery Diagnostics', install: false, uninstall: false) {
+        section('Source') {
+            paragraph buildSourceHtml()
+        }
+
+        section('Last message') {
+            paragraph "<pre style='white-space:pre-wrap;font-size:12px;'>${htmlEncode(state.lastMessage ?: '')}</pre>"
             if (state.lastError) {
-                paragraph "<pre style='white-space:pre-wrap;font-size:11px;color:#8a1f11;'>${htmlEncode(state.lastError)}</pre>"
+                paragraph "<pre style='white-space:pre-wrap;font-size:12px;color:#8a1f11;'>${htmlEncode(state.lastError ?: '')}</pre>"
             }
         }
 
-        section("mDNS cache source") {
-            paragraph buildSourceUrlHtml()
+        section('mDNS sections') {
+            paragraph "<pre style='white-space:pre-wrap;font-size:11px;'>${htmlEncode(prettyValue(state.mdnsSections ?: []))}</pre>"
         }
 
-        section("Parsed mDNS service sections") {
-            paragraph "<pre style='white-space:pre-wrap;font-size:11px;'>${htmlEncode(toPrettyText(state.mdnsSections ?: []))}</pre>"
+        section('Current parsed devices') {
+            paragraph "<pre style='white-space:pre-wrap;font-size:11px;'>${htmlEncode(prettyValue(state.currentDevices ?: [:]))}</pre>"
         }
 
-        section("Raw cached devices") {
-            paragraph "<pre style='white-space:pre-wrap;font-size:11px;'>${htmlEncode(toPrettyText(state.discoveredDevices ?: [:]))}</pre>"
+        section('Previously discovered devices') {
+            paragraph "<pre style='white-space:pre-wrap;font-size:11px;'>${htmlEncode(prettyValue(state.deviceHistory ?: [:]))}</pre>"
         }
 
-        if (state.rawJsonSample) {
-            section("Raw mDNS cache sample") {
-                paragraph "<pre style='white-space:pre-wrap;font-size:10px;'>${htmlEncode(state.rawJsonSample)}</pre>"
+        if (state.rawSample) {
+            section('Raw endpoint sample') {
+                paragraph "<pre style='white-space:pre-wrap;font-size:10px;'>${htmlEncode(state.rawSample ?: '')}</pre>"
             }
         }
     }
 }
 
 def appButtonHandler(String btn) {
-    if (logEnable) {
-        log.debug "Button pressed: ${btn}"
-    }
+    if (logEnable == true) log.debug "Button pressed: ${btn}"
 
     switch (btn) {
-        case "mdnsDiscoverBtn":
-            startMdnsDiscovery()
+        case 'runDiscoveryBtn':
+            runDiscoveryNow()
             break
-        case "clearDiscoveredBtn":
-            clearDiscoveredDevices()
+        case 'clearCurrentBtn':
+            clearCurrentResults()
+            break
+        case 'clearAllBtn':
+            clearAllResults()
             break
         default:
             log.warn "Unhandled button: ${btn}"
@@ -331,1347 +178,935 @@ def appButtonHandler(String btn) {
     }
 }
 
-def startMdnsDiscovery() {
-    state.discoveryRunning = true
-    state.discoveryStartedAt = formatNow()
-    state.discoveryCompletedAt = null
-    state.lastCheckedIp = "Hubitat mDNS cache"
-    state.lastError = null
-
-    Boolean doProbe = enablePreScanMdnsProbe != false
-    Integer bursts = doProbe ? getPreScanProbeBursts() : 0
-
-    state.asyncDoProbe = doProbe
-    state.asyncProbeBursts = bursts
-    state.asyncProbeIndex = 0
-    state.asyncPhase = doProbe && bursts > 0 ? "probe" : "read"
-    state.asyncStartedMs = nowMs()
-    state.asyncNextStepMs = nowMs()
-    state.asyncSettleMs = getPreScanLateWaitMs()
-
-    // UI-compatible page-driven scan steps:
-    // 1..N = optional probe bursts
-    // +1 = cache settle wait
-    // +1 = JSON endpoint read
-    // +1 = resolve/display complete
-    state.scanTotal = bursts + 3
-    state.scanCompleted = 0
-
-    state.lastDiscoveryMessage = doProbe ?
-        "Discovery started. Google Cast mDNS pre-scan will complete in about 5 seconds." :
-        "Discovery started. Hubitat mDNS cache read will complete in about 5 seconds."
-
-    log.info state.lastDiscoveryMessage
+def scheduledDiscovery() {
+    runDiscoveryNow()
 }
 
-def advanceDiscoveryFromPageRefresh() {
-    if (state.discoveryRunning != true) {
-        return
-    }
+def runDiscoveryNow() {
+    state.lastRunAt = formatNow()
+    state.lastError = null
+    state.lastMessage = 'Discovery started. Reading Hubitat mDNS cache now.'
+    state.discoveryRunning = true
 
-    Long now = nowMs()
-    Long due = safeLong(state.asyncNextStepMs ?: 0L)
-
-    if (due > 0L && now < due) {
-        return
-    }
-
-    String phase = state.asyncPhase?.toString() ?: "read"
-    Integer bursts = safeInt(state.asyncProbeBursts)
-    Integer index = safeInt(state.asyncProbeIndex)
-
-    if (phase == "probe") {
-        if (index < bursts) {
-            index = index + 1
-            state.asyncProbeIndex = index
-            state.scanCompleted = index
-            state.lastDiscoveryMessage = "Discovery pre-scan ${index}/${bursts}. Sending Google Cast mDNS probe."
-
-            sendMdnsGoogleCastProbe()
-
-            if (index < bursts) {
-                state.asyncNextStepMs = now + getPreScanPauseMs()
-            } else {
-                state.asyncPhase = "settle"
-                state.scanCompleted = bursts + 1
-                state.lastDiscoveryMessage = "Discovery pre-scan complete. Waiting ${getPreScanLateWaitMs()} ms for Hubitat mDNS cache to update."
-                state.asyncNextStepMs = now + getPreScanLateWaitMs()
-            }
-
-            return
+    try {
+        if (wakeBeforeDiscovery == true) {
+            wakeSelectedChromecastDevices()
         }
 
-        state.asyncPhase = "settle"
-        state.asyncNextStepMs = now + getPreScanLateWaitMs()
-        return
+        if (sendProbeBeforeRead != false) {
+            sendMdnsProbes()
+        }
+
+        // Hubitat app code is unreliable when a button press depends on a later runIn()
+        // while the dynamic preference page is open. Read immediately so the button action
+        // completes in the same execution context and the page updates deterministically.
+        completeDiscoveryRead()
+    } catch (Exception e) {
+        state.discoveryRunning = false
+        state.currentDevices = [:]
+        state.lastError = "Unexpected discovery error: ${e.message}"
+        state.lastMessage = "Discovery failed. ${state.lastError}"
+        log.warn state.lastMessage
     }
+}
 
-    if (phase == "settle") {
-        state.asyncPhase = "read"
-        state.asyncNextStepMs = now
-        state.lastDiscoveryMessage = "Discovery settle complete. Reading Hubitat mDNS cache next."
-        return
-    }
-
-    if (phase == "read") {
-        state.scanCompleted = bursts + 2
-        state.lastDiscoveryMessage = "Discovery in progress. Reading Hubitat mDNS service registry."
-
+def completeDiscoveryRead() {
+    try {
         Map result = fetchMdnsCache()
 
         if (result.ok == true) {
-            state.discoveredDevices = result.devices ?: [:]
-            state.mdnsSections = result.sections ?: []
-            mergeDiscoveryHistory(state.discoveredDevices ?: [:])
-            state.lastWorkingUrl = result.url
-            state.rawJsonSample = storeRawJsonSample == false ? null : trimForStorage(result.rawText?.toString(), 100000)
+            Map previousCurrent = state.currentDevices instanceof Map ? state.currentDevices : [:]
+            Map newCurrent = result.devices instanceof Map ? result.devices : [:]
 
-            Integer clean = getVisibleDiscoveredDevices()?.size() ?: 0
-            Integer allSections = state.mdnsSections?.size() ?: 0
+            state.currentDevices = newCurrent
+            state.mdnsSections = result.sections instanceof List ? result.sections : []
+            state.lastWorkingUrl = result.url ?: state.lastWorkingUrl
+            state.lastSuccessAt = formatNow()
+            state.rawSample = storeRawSample == false ? null : trimForStorage(result.rawText?.toString(), 120000)
 
-            state.lastDiscoveryMessage = "Discovery cache read complete. Clean devices: ${clean}. mDNS service sections: ${allSections}."
-            state.lastError = clean == 0 ? "mDNS cache was read successfully but no Google Cast devices were resolved." : null
+            mergeIntoHistory(previousCurrent)
+            mergeIntoHistory(newCurrent)
+            pruneHistory()
 
-            if (descriptionTextEnable) {
-                log.info state.lastDiscoveryMessage
-            }
+            Integer clean = newCurrent.size()
+            Integer sections = state.mdnsSections?.size() ?: 0
+            state.lastMessage = "Discovery completed. Clean Chromecast records: ${clean}. mDNS service sections parsed: ${sections}. Source: ${state.lastWorkingUrl ?: 'unknown'}."
+            log.info state.lastMessage
         } else {
-            state.discoveredDevices = [:]
-            state.mdnsSections = []
-            state.rawJsonSample = result.rawText ? trimForStorage(result.rawText?.toString(), 100000) : null
-            state.lastError = result.error ?: "Unknown mDNS cache discovery error"
-            state.lastDiscoveryMessage = "Discovery scan failed. ${state.lastError}"
-            log.warn state.lastDiscoveryMessage
-        }
-
-        state.asyncPhase = "finish"
-        state.asyncNextStepMs = now + 500L
-        return
-    }
-
-    if (phase == "finish") {
-        state.scanCompleted = state.scanTotal ?: safeInt(state.scanCompleted)
-        finishMdnsDiscovery()
-        return
-    }
-}
-
-
-def sendMdnsGoogleCastProbe() {
-    // These probes are cache stimulation only. The device list is still read from /hub/mdnsDevices/json.
-    sendMdnsQuery("_googlecast._tcp.local PTR", "0000000000010000000000000b5f676f6f676c6563617374045f746370056c6f63616c00000c0001")
-    sendMdnsQuery("_googlezone._tcp.local PTR", "0000000000010000000000000b5f676f6f676c657a6f6e65045f746370056c6f63616c00000c0001")
-    sendMdnsQuery("_services._dns-sd._udp.local PTR", "000000000001000000000000095f7365727669636573075f646e732d7364045f756470056c6f63616c00000c0001")
-}
-
-def sendMdnsQuery(String label, String queryHex) {
-    try {
-        sendHubCommand(
-            new hubitat.device.HubAction(
-                queryHex,
-                hubitat.device.Protocol.LAN,
-                [
-                    type: hubitat.device.HubAction.Type.LAN_TYPE_UDPCLIENT,
-                    destinationAddress: "224.0.0.251:5353",
-                    encoding: hubitat.device.HubAction.Encoding.HEX_STRING,
-                    ignoreWarning: true
-                ]
-            )
-        )
-
-        if (logEnable) {
-            log.debug "mDNS pre-scan probe sent for ${label}."
+            state.currentDevices = [:]
+            state.mdnsSections = result.sections instanceof List ? result.sections : []
+            state.rawSample = result.rawText ? trimForStorage(result.rawText?.toString(), 120000) : null
+            state.lastError = result.error ?: 'Unknown discovery failure.'
+            state.lastMessage = "Discovery failed. ${state.lastError}"
+            log.warn state.lastMessage
         }
     } catch (Exception e) {
-        state.lastError = "mDNS pre-scan probe failed for ${label}: ${e.message}"
-        log.warn state.lastError
+        state.currentDevices = [:]
+        state.lastError = "Unexpected discovery read error: ${e.message}"
+        state.lastMessage = "Discovery failed. ${state.lastError}"
+        log.warn state.lastMessage
+    } finally {
+        state.discoveryRunning = false
     }
 }
 
-
-def backgroundRefreshDiscovery() {
-    if (state.discoveryRunning == true) {
+void wakeSelectedChromecastDevices() {
+    if (!chromecastWakeDevices) {
+        if (logEnable == true) log.debug 'Wake requested but no Chromecast child devices selected.'
         return
     }
 
-    if (logEnable) {
-        log.debug "Background Chromecast discovery refresh starting"
+    Integer count = 0
+    List failures = []
+
+    chromecastWakeDevices.each { dev ->
+        try {
+            dev.speak(' ')
+            count++
+            if (logEnable == true) log.debug "Wake shim sent to ${dev.displayName}"
+        } catch (Exception e) {
+            failures << "${dev.displayName}: ${e.message}"
+        }
     }
 
-    startMdnsDiscovery()
+    if (failures) {
+        state.lastError = "Wake failures: ${failures.join(' | ')}"
+        log.warn state.lastError
+    }
+
+    if (logEnable == true) log.debug "Wake shim sent to ${count} Chromecast child device(s)."
 }
 
-def finishMdnsDiscovery() {
-    state.discoveryRunning = false
-    state.scanCompleted = state.scanTotal ?: 4
-    state.discoveryCompletedAt = formatNow()
+void sendMdnsProbes() {
+    Integer bursts = clampInt(safeInt(probeBursts ?: 2), 0, 20)
 
-    Integer clean = getVisibleDiscoveredDevices()?.size() ?: 0
-    Integer raw = state.discoveredDevices?.size() ?: 0
-    Integer unresolved = getUnresolvedRecordCount()
-
-    if (!state.lastDiscoveryMessage || !state.lastDiscoveryMessage.toString().startsWith("Discovery scan failed")) {
-        state.lastDiscoveryMessage = "Discovery scan completed. Clean devices: ${clean}. Raw records: ${raw}. Hidden unresolved: ${unresolved}."
+    for (Integer i = 0; i < bursts; i++) {
+        sendMdnsQuery('Google Cast PTR', '0000000000010000000000000b5f676f6f676c6563617374045f746370056c6f63616c00000c0001')
+        sendMdnsQuery('Google Zone PTR', '0000000000010000000000000b5f676f6f676c657a6f6e65045f746370056c6f63616c00000c0001')
+        sendMdnsQuery('Services PTR', '000000000001000000000000095f7365727669636573075f646e732d7364045f756470056c6f63616c00000c0001')
     }
+}
 
-    log.info state.lastDiscoveryMessage
+void sendMdnsQuery(String label, String queryHex) {
+    try {
+        sendHubCommand(new hubitat.device.HubAction(
+            queryHex,
+            hubitat.device.Protocol.LAN,
+            [
+                type: hubitat.device.HubAction.Type.LAN_TYPE_UDPCLIENT,
+                destinationAddress: '224.0.0.251:5353',
+                encoding: hubitat.device.HubAction.Encoding.HEX_STRING,
+                ignoreWarning: true
+            ]
+        ))
+        if (logEnable == true) log.debug "mDNS probe sent: ${label}"
+    } catch (Exception e) {
+        log.warn "mDNS probe failed for ${label}: ${e.message}"
+    }
 }
 
 Map fetchMdnsCache() {
-    List urls = getMdnsJsonUrlCandidates()
+    List<String> urls = getMdnsEndpointCandidates()
     List failures = []
 
     for (String url in urls) {
-        try {
-            Map result = fetchAndParseMdnsJson(url)
-            if (result.ok == true) {
-                result.url = url
-                return result
-            }
-
-            failures << "${url} -> ${result.error ?: 'not ok'}"
-        } catch (Exception e) {
-            failures << "${url} -> ${e.message}"
-            log.warn "mDNS cache candidate failed: ${url} -> ${e.message}"
+        Map result = fetchAndParseEndpoint(url)
+        if (result.ok == true) {
+            result.url = url
+            return result
         }
+        failures << "${url} -> ${result.error ?: 'not ok'}"
     }
 
     return [
         ok: false,
-        error: failures.join(" | "),
+        error: failures ? failures.join(' | ') : 'No mDNS endpoint candidates available.',
+        rawText: null,
         devices: [:],
         sections: []
     ]
 }
 
-Map fetchAndParseMdnsJson(String url) {
-    Map out = [
-        ok: false,
-        url: url,
-        error: null,
-        rawText: null,
-        devices: [:],
-        sections: []
-    ]
+Map fetchAndParseEndpoint(String url) {
+    Map out = [ok: false, url: url, error: null, rawText: null, devices: [:], sections: []]
 
-    Map params = [
-        uri: url,
-        contentType: "application/json",
-        timeout: 15,
-        headers: [
-            "Accept": "application/json,text/plain,*/*"
+    try {
+        Map params = [
+            uri: url,
+            timeout: 15,
+            headers: ['Accept': 'application/json,text/html,text/plain,*/*']
         ]
-    ]
 
-    httpGet(params) { resp ->
-        Integer status = safeInt(resp?.status)
-
-        if (status < 200 || status >= 300) {
-            out.error = "HTTP ${status}"
-            return
-        }
-
-        Object data = resp?.data
-        Object json = data
-        String rawText = null
-
-        try {
-            rawText = data?.toString()
-        } catch (Exception ignored) {}
-
-        out.rawText = rawText
-
-        if (data instanceof String) {
-            String s = data.toString()
-            out.rawText = s
-
-            if (!s.trim()) {
-                out.error = "empty response"
+        httpGet(params) { resp ->
+            Integer status = safeInt(resp?.status)
+            if (status < 200 || status >= 300) {
+                out.error = "HTTP ${status}"
                 return
             }
 
-            json = new JsonSlurper().parseText(s)
+            Object data = resp?.data
+            String raw = data?.toString() ?: ''
+            out.rawText = raw
+
+            Map parsed
+            if (looksLikeHtml(raw)) {
+                parsed = parseMdnsHtml(raw)
+            } else {
+                parsed = parseMdnsPossiblyJson(data, raw)
+            }
+
+            out.devices = parsed.devices instanceof Map ? parsed.devices : [:]
+            out.sections = parsed.sections instanceof List ? parsed.sections : []
+
+            if (!out.devices && !out.sections) {
+                out.error = 'Endpoint was reachable but no mDNS records were parsed.'
+                return
+            }
+
+            out.ok = true
         }
-
-        Map parsed = parseHubitatMdnsJson(json)
-        out.devices = parsed.devices ?: [:]
-        out.sections = parsed.sections ?: []
-
-        if (!out.sections && !out.devices) {
-            out.error = "No mDNS service sections or devices found in cache"
-            return
-        }
-
-        out.ok = true
+    } catch (Exception e) {
+        out.error = e.message
     }
 
     return out
 }
 
-Map parseHubitatMdnsJson(Object json) {
+Boolean looksLikeHtml(String raw) {
+    String s = raw?.trim()?.toLowerCase() ?: ''
+    return s.startsWith('<!doctype') || s.startsWith('<html') || s.contains('<table') || s.contains('<tr')
+}
+
+Map parseMdnsPossiblyJson(Object data, String raw) {
+    Object json = data
+
+    if (data instanceof String) {
+        String s = raw?.trim() ?: ''
+        if (!s) return [devices: [:], sections: []]
+        json = new JsonSlurper().parseText(s)
+    }
+
+    return parseMdnsJsonFlexible(json)
+}
+
+Map parseMdnsJsonFlexible(Object json) {
     Map devices = [:]
     List sections = []
 
-    if (!(json instanceof Map)) {
+    if (!json) return [devices: devices, sections: sections]
+
+    if (json instanceof Map) {
+        Map root = json as Map
+
+        if (root.serviceTypes instanceof List) {
+            parseServiceTypeList(root.serviceTypes as List, devices, sections)
+            return [devices: devices, sections: sections]
+        }
+
+        if (root.services instanceof List) {
+            parseServiceTypeList(root.services as List, devices, sections)
+            return [devices: devices, sections: sections]
+        }
+
+        root.each { k, v ->
+            String serviceType = cleanupService(k?.toString())
+            List endpoints = extractEndpointList(v)
+            parseEndpointListForService(serviceType, endpoints, devices, sections)
+        }
+
         return [devices: devices, sections: sections]
     }
 
-    Map root = json as Map
-    Object serviceTypesObj = root.get("serviceTypes")
-
-    if (!(serviceTypesObj instanceof List)) {
-        return [devices: devices, sections: sections]
-    }
-
-    (serviceTypesObj as List).each { svcObj ->
-        if (!(svcObj instanceof Map)) {
-            return
-        }
-
-        Map svcMap = svcObj as Map
-        String serviceType = cleanupService(svcMap.get("serviceType")?.toString())
-        Integer declaredCount = safeNullableInt(svcMap.get("count"))
-        Object endpointsObj = svcMap.get("endpoints")
-
-        Integer parsedCount = 0
-        Integer cleanCount = 0
-
-        if (endpointsObj instanceof List) {
-            (endpointsObj as List).each { epObj ->
-                if (!(epObj instanceof Map)) {
-                    return
-                }
-
-                Map ep = epObj as Map
-                Map item = normaliseHubitatEndpoint(ep, serviceType)
-
-                if (item.name || item.ip || item.host) {
-                    parsedCount = parsedCount + 1
-                }
-
-                if (serviceType?.toLowerCase()?.contains("googlecast")) {
-                    String key = makeDiscoveryKey(item)
-                    devices[key] = item
-                    cleanCount = cleanCount + 1
-                }
-            }
-        }
-
-        sections << [
-            serviceType: serviceType,
-            declaredCount: declaredCount,
-            parsedCount: parsedCount,
-            cleanGoogleCastCount: cleanCount
-        ]
+    if (json instanceof List) {
+        List records = json as List
+        parseEndpointListForService(GOOGLECAST_SERVICE, records, devices, sections)
     }
 
     return [devices: devices, sections: sections]
 }
 
-Map normaliseHubitatEndpoint(Map m, String service) {
-    Map txt = m.get("txtProperties") instanceof Map ? (m.get("txtProperties") as Map) : [:]
-
-    String name = stringFirst(m.get("friendlyName"), m.get("name"), txt.get("fn"), m.get("eventName"))
-    String host = stringFirst(m.get("server"))
-    String ip = stringFirst(m.get("ip4Address"), m.get("ipv4Address"), m.get("ipAddress"), m.get("ip"))
-    String port = stringFirst(m.get("port"))
-    String lastUpdated = stringFirst(m.get("lastUpdated"))
-    String model = stringFirst(m.get("model"), txt.get("md"))
-    String status = stringFirst(m.get("status"), txt.get("st"))
-    String receiverStatus = stringFirst(m.get("receiverStatus"), txt.get("rs"))
-    String deviceId = stringFirst(m.get("deviceId"), txt.get("id"))
-    String macAddress = stringFirst(m.get("macAddress"))
-
-    Map item = [
-        key: null,
-        ip: ip ?: "",
-        port: port ?: "",
-        name: cleanupName(name),
-        model: model ?: "Google Cast Device",
-        firmware: stringFirst(m.get("version"), txt.get("ve"), "mDNS"),
-        source: "mDNS",
-        serviceType: service ?: "",
-        host: cleanupHost(host),
-        mdnsId: deviceId ?: "",
-        instance: stringFirst(m.get("eventName")),
-        macAddress: macAddress ?: "",
-        status: status ?: "",
-        receiverStatus: receiverStatus ?: "",
-        discoveredAt: stringFirst(state.discoveryStartedAt, formatNow()),
-        lastSeenDuringDiscovery: lastUpdated ?: formatNow(),
-        lastUpdated: lastUpdated ?: "",
-        stale: isStaleLastUpdated(lastUpdated),
-        updatedMinutesAgo: minutesSinceLastUpdated(lastUpdated)
-    ]
-
-    item.type = inferDeviceType(item)
-    item.badge = inferBadge(item)
-    item.key = makeDiscoveryKey(item)
-
-    return item
+void parseServiceTypeList(List serviceTypes, Map devices, List sections) {
+    serviceTypes.each { svcObj ->
+        if (!(svcObj instanceof Map)) return
+        Map svc = svcObj as Map
+        String serviceType = cleanupService(stringFirst(svc.serviceType, svc.type, svc.name, svc.service, ''))
+        List endpoints = extractEndpointList(svc.endpoints ?: svc.devices ?: svc.records ?: svc.instances)
+        parseEndpointListForService(serviceType, endpoints, devices, sections, safeNullableInt(svc.count))
+    }
 }
 
-String makeDiscoveryKey(Map item) {
-    String identity = item.mdnsId ?: item.host ?: "${item.name}-${item.ip}-${item.port}"
-    return "mdns-${sanitizeKey(identity)}"
+List extractEndpointList(Object obj) {
+    if (obj instanceof List) return obj as List
+    if (obj instanceof Map) {
+        Map m = obj as Map
+        if (m.endpoints instanceof List) return m.endpoints as List
+        if (m.devices instanceof List) return m.devices as List
+        if (m.records instanceof List) return m.records as List
+        if (m.instances instanceof List) return m.instances as List
+        return [m]
+    }
+    return []
 }
 
-def clearDiscoveredDevices() {
-    state.discoveredDevices = [:]
-    state.discoveryHistory = [:]
-    state.mdnsSections = []
-    state.discoveryRunning = false
-    state.scanTotal = 0
-    state.scanCompleted = 0
-    state.discoveryStartedAt = null
-    state.discoveryCompletedAt = null
-    state.lastCheckedIp = null
-    state.lastDiscoveryMessage = null
-    state.lastError = null
-    state.rawJsonSample = null
-    unschedule("backgroundRefreshDiscovery")
-    state.asyncDoProbe = null
-    state.asyncProbeBursts = null
-    state.asyncProbeIndex = null
-    state.asyncSettleSeconds = null
-    state.asyncPhase = null
-    state.asyncNextStepMs = null
-    state.asyncStartedMs = null
-    state.asyncSettleMs = null
-    initialise()
-    log.info "Accumulated Chromecast mDNS discovery list cleared."
-}
+void parseEndpointListForService(String serviceType, List endpoints, Map devices, List sections, Integer declaredCount = null) {
+    String svc = cleanupService(serviceType)
+    Integer parsedCount = 0
+    Integer cleanCastCount = 0
 
-Map getVisibleDiscoveredDevices() {
-    Map raw = state.discoveredDevices ?: [:]
-    Map visible = [:]
+    endpoints.each { epObj ->
+        if (!(epObj instanceof Map)) return
 
-    raw.each { key, item ->
-        if (!isCleanVisibleItem(item)) {
-            return
-        }
+        Map item = normaliseEndpoint(epObj as Map, svc)
+        if (item.name || item.ip || item.host) parsedCount++
 
-        if (isPastActiveDiscoveryWindow(item)) {
-            return
-        }
-
-        String displayKey = makeDisplayDiscoveryKey(item)
-        Map existing = visible[displayKey]
-
-        if (!existing) {
-            visible[displayKey] = item + [rawKey: key, displayKey: displayKey]
-        } else {
-            visible[displayKey] = chooseBetterDiscoveryItem(existing, item + [rawKey: key, displayKey: displayKey])
+        if (isGoogleCastService(svc, item) && isCleanDevice(item)) {
+            String key = makeDeviceKey(item)
+            devices[key] = item + [key: key]
+            cleanCastCount++
         }
     }
 
-    return visible
+    if (svc || parsedCount > 0 || declaredCount != null) {
+        sections << [
+            serviceType: svc,
+            declaredCount: declaredCount != null ? declaredCount : endpoints.size(),
+            parsedCount: parsedCount,
+            cleanGoogleCastCount: cleanCastCount
+        ]
+    }
 }
 
-Map getPreviouslyDiscoveredDevices() {
-    pruneDiscoveryHistory()
+Map normaliseEndpoint(Map m, String serviceType) {
+    Map txt = firstMap(m.txtProperties, m.txtRecord, m.txt, m.properties)
 
-    Map history = state.discoveryHistory ?: [:]
-    Map active = getVisibleDiscoveredDevices() ?: [:]
+    String rawName = stringFirst(
+        m.friendlyName,
+        m.displayName,
+        m.name,
+        txt.fn,
+        txt.nm,
+        txt.name,
+        m.eventName,
+        m.instanceName,
+        m.instance
+    )
+
+    String host = cleanupHost(stringFirst(m.server, m.host, m.hostname, m.target, m.domainName))
+    String ip = stringFirst(m.ip4Address, m.ipv4Address, m.ipAddress, m.address, m.ip, m.hostAddress)
+    String port = stringFirst(m.port, m.servicePort)
+    String model = stringFirst(m.model, m.modelName, txt.md, txt.model, inferModelFromText(rawName, host))
+    String deviceId = stringFirst(m.deviceId, m.id, txt.id, txt.uuid)
+    String lastUpdated = stringFirst(m.lastUpdated, m.updated, m.lastSeen, m.lastSeenDuringDiscovery)
+    String status = stringFirst(m.status, txt.st)
+    String receiverStatus = stringFirst(m.receiverStatus, txt.rs)
+
+    Map item = [
+        key: '',
+        name: cleanupName(rawName),
+        ip: cleanupIp(ip),
+        port: port ?: '',
+        model: model ?: 'Google Cast Device',
+        type: '',
+        status: status ?: '',
+        receiverStatus: receiverStatus ?: '',
+        host: host,
+        serviceType: cleanupService(serviceType),
+        mdnsId: deviceId ?: '',
+        instance: cleanupName(stringFirst(m.eventName, m.instanceName, m.instance, rawName)),
+        source: 'mDNS JSON',
+        firmware: stringFirst(m.version, txt.ve, txt.version, ''),
+        macAddress: stringFirst(m.macAddress, m.mac, ''),
+        lastUpdated: lastUpdated ?: '',
+        lastSeen: lastUpdated ?: formatNow(),
+        discoveredAt: formatNow(),
+        lastActiveAt: formatNow(),
+        lastActiveMs: nowMs()
+    ]
+
+    item.type = inferDeviceType(item)
+    return item
+}
+
+Map parseMdnsHtml(String html) {
+    Map devices = [:]
+    List sections = []
+
+    String currentService = ''
+    Map sectionStats = [:]
+
+    // Hubitat's rendered page is usually a table per service type. Keep the parser deliberately tolerant.
+    String normalised = html ?: ''
+    normalised = normalised.replace('\r', '\n')
+
+    // Track service headers even if they appear outside table rows.
+    normalised.eachLine { line ->
+        String text = stripHtml(line).trim()
+        if (text.contains('_googlecast._tcp.local')) currentService = GOOGLECAST_SERVICE
+        if (text.contains('_googlezone._tcp.local')) currentService = GOOGLEZONE_SERVICE
+        if (text.contains('_services._dns-sd._udp.local')) currentService = SERVICES_SERVICE
+    }
+
+    currentService = currentService ?: GOOGLECAST_SERVICE
+
+    def rowMatcher = normalised =~ /(?is)<tr[^>]*>(.*?)<\/tr>/
+    while (rowMatcher.find()) {
+        String row = rowMatcher.group(1)
+        String rowText = stripHtml(row).replaceAll(/\s+/, ' ').trim()
+
+        if (!rowText) continue
+        if (rowText.toLowerCase().contains('device') && rowText.toLowerCase().contains('last updated')) continue
+
+        if (rowText.contains('_googlecast._tcp.local')) {
+            currentService = GOOGLECAST_SERVICE
+            ensureSectionStats(sectionStats, currentService)
+            continue
+        }
+
+        if (!currentService?.contains('googlecast')) continue
+
+        Map item = parseHtmlDeviceRow(row, currentService)
+        if (isCleanDevice(item)) {
+            String key = makeDeviceKey(item)
+            devices[key] = item + [key: key]
+            Map stats = ensureSectionStats(sectionStats, currentService)
+            stats.parsedCount = safeInt(stats.parsedCount) + 1
+            stats.cleanGoogleCastCount = safeInt(stats.cleanGoogleCastCount) + 1
+        }
+    }
+
+    // Fallback for pages where Hubitat does not emit regular <tr> rows into resp.data.
+    if (!devices) {
+        parseHtmlByLines(normalised, currentService, devices, sectionStats)
+    }
+
+    sectionStats.each { svc, stats ->
+        sections << [
+            serviceType: svc,
+            declaredCount: stats.declaredCount,
+            parsedCount: stats.parsedCount,
+            cleanGoogleCastCount: stats.cleanGoogleCastCount
+        ]
+    }
+
+    if (!sections) {
+        sections << [serviceType: currentService ?: 'html', declaredCount: null, parsedCount: devices.size(), cleanGoogleCastCount: devices.size()]
+    }
+
+    return [devices: devices, sections: sections]
+}
+
+void parseHtmlByLines(String html, String serviceType, Map devices, Map sectionStats) {
+    List<String> lines = []
+    html.eachLine { line ->
+        String text = stripHtml(line).replaceAll(/\s+/, ' ').trim()
+        if (text) lines << text
+    }
+
+    String svc = serviceType ?: GOOGLECAST_SERVICE
+    Map stats = ensureSectionStats(sectionStats, svc)
+
+    for (Integer i = 0; i < lines.size(); i++) {
+        String line = lines[i]
+        def ipMatch = line =~ /(\d{1,3}(?:\.\d{1,3}){3})\s*:?\s*(\d{2,5})/
+        if (!ipMatch.find()) continue
+
+        String ip = ipMatch.group(1)
+        String port = ipMatch.group(2)
+        if (!isValidSimpleIp(ip)) continue
+
+        String name = line.replaceAll(/\d{1,3}(?:\.\d{1,3}){3}\s*:?\s*\d{2,5}.*/, '').trim()
+        if (!name && i > 0) name = lines[i - 1]
+
+        Map item = makeHtmlItem(name, ip, port, '', svc)
+        if (isCleanDevice(item)) {
+            String key = makeDeviceKey(item)
+            devices[key] = item + [key: key]
+            stats.parsedCount = safeInt(stats.parsedCount) + 1
+            stats.cleanGoogleCastCount = safeInt(stats.cleanGoogleCastCount) + 1
+        }
+    }
+}
+
+Map parseHtmlDeviceRow(String row, String serviceType) {
+    List cells = []
+    def cellMatcher = row =~ /(?is)<td[^>]*>(.*?)<\/td>/
+    while (cellMatcher.find()) {
+        cells << stripHtml(cellMatcher.group(1)).replaceAll(/\s+/, ' ').trim()
+    }
+
+    String deviceCell = cells ? cells[0]?.toString() : stripHtml(row).replaceAll(/\s+/, ' ').trim()
+    String lastUpdated = cells.size() >= 2 ? cells[1]?.toString() : ''
+
+    def ipMatch = deviceCell =~ /(\d{1,3}(?:\.\d{1,3}){3})\s*:?\s*(\d{2,5})/
+    if (!ipMatch.find()) return [:]
+
+    String ip = ipMatch.group(1)
+    String port = ipMatch.group(2)
+
+    String name = deviceCell.replaceAll(/\d{1,3}(?:\.\d{1,3}){3}\s*:?\s*\d{2,5}.*/, '').trim()
+    return makeHtmlItem(name, ip, port, lastUpdated, serviceType)
+}
+
+Map makeHtmlItem(String name, String ip, String port, String lastUpdated, String serviceType) {
+    String cleanName = cleanupName(name)
+    Map item = [
+        key: '',
+        name: cleanName,
+        ip: cleanupIp(ip),
+        port: port ?: '',
+        model: inferModelFromText(cleanName, ''),
+        type: '',
+        status: '',
+        receiverStatus: '',
+        host: extractHostFromName(name),
+        serviceType: cleanupService(serviceType ?: GOOGLECAST_SERVICE),
+        mdnsId: '',
+        instance: cleanName,
+        source: 'mDNS HTML',
+        firmware: '',
+        macAddress: '',
+        lastUpdated: lastUpdated ?: '',
+        lastSeen: lastUpdated ?: formatNow(),
+        discoveredAt: formatNow(),
+        lastActiveAt: formatNow(),
+        lastActiveMs: nowMs()
+    ]
+
+    item.type = inferDeviceType(item)
+    return item
+}
+
+Map ensureSectionStats(Map sectionStats, String serviceType) {
+    String svc = cleanupService(serviceType ?: 'unknown')
+    if (!(sectionStats[svc] instanceof Map)) {
+        sectionStats[svc] = [declaredCount: null, parsedCount: 0, cleanGoogleCastCount: 0]
+    }
+    return sectionStats[svc] as Map
+}
+
+Boolean isGoogleCastService(String serviceType, Map item = null) {
+    // Deliberately strict.
+    // Hubitat /hub/mdnsDevices also returns _hue._tcp.local and _matter._tcp.local.
+    // Those rows can have generic/default model text and must not be promoted into the
+    // Chromecast inventory just because the fallback model contains the word 'Cast'.
+    String svc = cleanupService(serviceType)?.toLowerCase() ?: ''
+    return svc == GOOGLECAST_SERVICE || svc == "${GOOGLECAST_SERVICE}." || svc.contains('_googlecast._tcp.local')
+}
+
+Boolean isCleanDevice(Map item) {
+    if (!item) return false
+    if (!item.name || isBadName(item.name.toString())) return false
+    if (!item.ip || !isValidSimpleIp(item.ip.toString())) return false
+    if (!item.port) return false
+    return true
+}
+
+Boolean isBadName(String name) {
+    String n = name?.toLowerCase()?.trim() ?: ''
+    if (!n) return true
+    if (n == 'device' || n == 'details') return true
+    if (n.contains('_googlecast._tcp.local')) return true
+    if (n.contains('_googlezone._tcp.local')) return true
+    if (n == 'google cast device' || n == 'google cast / dial') return true
+    return false
+}
+
+String makeDeviceKey(Map item) {
+    String id = item.mdnsId ?: ''
+    if (id) return "cast-${sanitizeKey(id)}"
+
+    String basis = "${item.name ?: 'cast'}-${item.ip ?: 'ip'}-${item.port ?: 'port'}"
+    return "cast-${sanitizeKey(basis)}"
+}
+
+void mergeIntoHistory(Map devices) {
+    Map history = state.deviceHistory instanceof Map ? state.deviceHistory : [:]
+
+    (devices ?: [:]).each { key, item ->
+        if (!(item instanceof Map)) return
+        if (!isCleanDevice(item as Map)) return
+
+        Map existing = history[key] instanceof Map ? history[key] as Map : [:]
+        Long now = nowMs()
+
+        history[key] = existing + item + [
+            key: key,
+            firstDiscoveredAt: existing.firstDiscoveredAt ?: item.discoveredAt ?: formatNow(),
+            lastActiveAt: formatNow(),
+            lastActiveMs: now
+        ]
+    }
+
+    state.deviceHistory = history
+}
+
+void pruneHistory() {
+    Map history = state.deviceHistory instanceof Map ? state.deviceHistory : [:]
+    Integer days = clampInt(safeInt(previousRetentionDays ?: 7), 1, 365)
+    Long cutoff = nowMs() - (days * 24L * 60L * 60L * 1000L)
+    Map retained = [:]
+
+    history.each { key, item ->
+        Long lastMs = safeLong(item?.lastActiveMs)
+        if (lastMs <= 0L) lastMs = nowMs()
+        if (lastMs >= cutoff) retained[key] = item
+    }
+
+    state.deviceHistory = retained
+}
+
+Map getPreviouslyDiscovered() {
+    pruneHistory()
+    Map current = state.currentDevices instanceof Map ? state.currentDevices : [:]
+    Map history = state.deviceHistory instanceof Map ? state.deviceHistory : [:]
     Map previous = [:]
 
     history.each { key, item ->
-        if (!isCleanVisibleItem(item)) {
-            return
-        }
-
-        if (active.containsKey(key)) {
-            return
-        }
-
-        previous[key] = item + [displayKey: key]
+        if (!current.containsKey(key)) previous[key] = item
     }
 
     return previous
 }
 
-Boolean isCleanVisibleItem(Map item) {
-    Boolean hasIp = item?.ip && isValidSimpleIp(item.ip.toString())
-    Boolean hasFriendlyName = item?.name && !isUnresolvedName(item.name.toString())
-    Boolean unresolved = isUnresolvedMdnsRecord(item)
-    return hasIp && hasFriendlyName && !unresolved
+void clearCurrentResults() {
+    state.currentDevices = [:]
+    state.mdnsSections = []
+    state.rawSample = null
+    state.lastMessage = 'Current discovery results cleared. History retained.'
+    state.lastError = null
+    log.info state.lastMessage
 }
 
-String makeDisplayDiscoveryKey(Map item) {
-    return item?.mdnsId ? "cast-${sanitizeKey(item.mdnsId)}" : makeDni(item.ip?.toString(), item.port?.toString())
+void clearAllResults() {
+    state.currentDevices = [:]
+    state.deviceHistory = [:]
+    state.mdnsSections = []
+    state.rawSample = null
+    state.lastRunAt = null
+    state.lastSuccessAt = null
+    state.lastWorkingUrl = null
+    state.lastMessage = 'All discovery results and history cleared.'
+    state.lastError = null
+    log.info state.lastMessage
 }
 
-Boolean isPastActiveDiscoveryWindow(Map item) {
-    Long seenMs = getBestSeenMs(item)
-
-    if (!seenMs || seenMs <= 0L) {
-        return false
-    }
-
-    return (nowMs() - seenMs) > getPreviouslyDiscoveredAfterMs()
-}
-
-Long getBestSeenMs(Map item) {
-    Long ms = timestampToMs(item?.lastSeenDuringDiscovery?.toString())
-    if (ms && ms > 0L) {
-        return ms
-    }
-
-    ms = timestampToMs(item?.lastUpdated?.toString())
-    if (ms && ms > 0L) {
-        return ms
-    }
-
-    ms = safeLong(item?.lastActiveMs)
-    if (ms && ms > 0L) {
-        return ms
-    }
-
-    return timestampToMs(item?.discoveredAt?.toString())
-}
-
-void mergeDiscoveryHistory(Map currentRawDevices) {
-    Map history = state.discoveryHistory ?: [:]
-
-    (currentRawDevices ?: [:]).each { rawKey, item ->
-        if (!isCleanVisibleItem(item)) {
-            return
-        }
-
-        String displayKey = makeDisplayDiscoveryKey(item)
-        Map existing = history[displayKey] instanceof Map ? (history[displayKey] as Map) : [:]
-        Long seenMs = getBestSeenMs(item)
-
-        if (!seenMs || seenMs <= 0L) {
-            seenMs = nowMs()
-        }
-
-        Map merged = existing + item + [
-            displayKey: displayKey,
-            rawKey: rawKey,
-            firstDiscoveredAt: existing.firstDiscoveredAt ?: item.discoveredAt ?: formatNow(),
-            lastActiveMs: isPastActiveDiscoveryWindow(item) && existing.lastActiveMs ? existing.lastActiveMs : seenMs,
-            lastActiveAt: isPastActiveDiscoveryWindow(item) && existing.lastActiveAt ? existing.lastActiveAt : formatDateTimeFromMs(seenMs),
-            lastSeenDuringDiscovery: item.lastSeenDuringDiscovery ?: item.lastUpdated ?: existing.lastSeenDuringDiscovery ?: existing.lastActiveAt ?: formatDateTimeFromMs(seenMs)
-        ]
-
-        history[displayKey] = merged
-    }
-
-    state.discoveryHistory = history
-    pruneDiscoveryHistory()
-}
-
-void pruneDiscoveryHistory() {
-    Map history = state.discoveryHistory ?: [:]
-    Long cutoffMs = nowMs() - getHistoryRetentionMs()
-    Map retained = [:]
-
-    history.each { key, item ->
-        Long lastActiveMs = safeLong(item?.lastActiveMs)
-
-        if (!lastActiveMs || lastActiveMs <= 0L) {
-            lastActiveMs = getBestSeenMs(item) ?: nowMs()
-        }
-
-        if (lastActiveMs >= cutoffMs) {
-            retained[key] = item + [lastActiveMs: lastActiveMs, lastActiveAt: item.lastActiveAt ?: formatDateTimeFromMs(lastActiveMs)]
-        }
-    }
-
-    state.discoveryHistory = retained
-}
-
-Map getRawDiagnosticDevices() {
-    Map raw = state.discoveredDevices ?: [:]
-    Map diagnostics = [:]
-
-    raw.each { key, item ->
-        if (isUnresolvedMdnsRecord(item) || !(item?.ip && isValidSimpleIp(item.ip.toString()))) {
-            diagnostics[key] = item
-        }
-    }
-
-    return diagnostics
-}
-
-Integer getUnresolvedRecordCount() {
-    return getRawDiagnosticDevices()?.size() ?: 0
-}
-
-Map chooseBetterDiscoveryItem(Map a, Map b) {
-    Integer scoreA = discoveryDisplayScore(a)
-    Integer scoreB = discoveryDisplayScore(b)
-
-    if (scoreB > scoreA) {
-        return b
-    }
-
-    Map merged = a
-    merged.ip = merged.ip ?: b.ip
-    merged.port = merged.port ?: b.port
-    merged.model = betterModelName(merged.model, b.model)
-    merged.source = mergeSourceText(merged.source, b.source)
-    merged.mdnsId = merged.mdnsId ?: b.mdnsId
-    merged.instance = merged.instance ?: b.instance
-    merged.receiverStatus = merged.receiverStatus ?: b.receiverStatus
-    return merged
-}
-
-Integer discoveryDisplayScore(Map item) {
-    Integer score = 0
-
-    if (item?.ip && isValidSimpleIp(item.ip.toString())) {
-        score += 20
-    }
-
-    if (item?.name && !isUnresolvedName(item.name.toString())) {
-        score += 50
-    }
-
-    if (item?.model && !item.model.toString().equalsIgnoreCase("Google Cast Device")) {
-        score += 10
-    }
-
-    if (item?.port) {
-        score += 5
-    }
-
-    return score
-}
-
-Boolean isUnresolvedMdnsRecord(Map item) {
-    if (!item) {
-        return true
-    }
-
-    String name = item.name?.toString() ?: ""
-    String model = item.model?.toString() ?: ""
-    Boolean hasIp = item?.ip && isValidSimpleIp(item.ip.toString())
-    Boolean hasFriendlyName = name && !isUnresolvedName(name)
-
-    if (hasIp && hasFriendlyName) {
-        return false
-    }
-
-    if (!hasFriendlyName) {
-        return true
-    }
-
-    if (!hasIp && model.equalsIgnoreCase("Google Cast Device")) {
-        return true
-    }
-
-    if (!hasIp && !item.mdnsId) {
-        return true
-    }
-
-    return false
-}
-
-Boolean isUnresolvedName(String name) {
-    if (!name) {
-        return true
-    }
-
-    String lower = name.toLowerCase().trim()
-
-    if (lower.contains("_googlezone._tcp.local") || lower.contains("_googlecast._tcp.local")) {
-        return true
-    }
-
-    if (lower == "_googlecast._tcp.local" || lower == "_googlezone._tcp.local") {
-        return true
-    }
-
-    if (lower == "google cast device" || lower == "google cast / dial") {
-        return true
-    }
-
-    if (lower ==~ /[a-f0-9]{6,}[-a-f0-9_\.]+/) {
-        return true
-    }
-
-    if (lower ==~ /.*[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}.*/) {
-        return true
-    }
-
-    return false
-}
-
-String betterModelName(existingModel, newModel) {
-    String existing = existingModel?.toString()
-    String fresh = newModel?.toString()
-
-    if (!existing || existing == "Unknown" || existing == "Google Cast Device") {
-        return fresh ?: existing
-    }
-
-    return existing
-}
-
-String mergeSourceText(existingSource, newSource) {
-    String existing = existingSource?.toString()
-    String fresh = newSource?.toString()
-
-    if (!existing) {
-        return fresh
-    }
-
-    if (!fresh || existing.contains(fresh)) {
-        return existing
-    }
-
-    return "${existing}+${fresh}"
-}
-
-def normalizeDiscoveryStateForUi() {
-    Integer total = safeInt(state.scanTotal)
-    Integer completed = safeInt(state.scanCompleted)
-
-    if (state.discoveryRunning == true && total > 0 && completed >= total) {
-        state.scanCompleted = total
-        state.discoveryRunning = false
-        state.discoveryCompletedAt = state.discoveryCompletedAt ?: formatNow()
-        state.lastDiscoveryMessage = state.lastDiscoveryMessage ?: "Discovery scan completed."
-    }
-}
-
-String buildDiscoveryStatusHtml() {
-    advanceDiscoveryFromPageRefresh()
-    normalizeDiscoveryStateForUi()
-
-    Integer rawCount = state.discoveredDevices?.size() ?: 0
-    Integer cleanCount = getVisibleDiscoveredDevices()?.size() ?: 0
-    Integer unresolvedCount = getUnresolvedRecordCount()
-    Integer expectedCount = getExpectedCleanDeviceCount()
-
-    Integer totalBursts = safeInt(state.scanTotal)
-    Integer completedBursts = safeInt(state.scanCompleted)
-    String msg = state.lastDiscoveryMessage ?: ""
-
-    Integer displayCompletedBursts = completedBursts
-    Boolean effectivelyAtEnd = (totalBursts > 0 && completedBursts >= totalBursts)
-
-    if (effectivelyAtEnd) {
-        displayCompletedBursts = totalBursts
-    }
-
-    Integer runProgress = 0
-    if (totalBursts > 0) {
-        runProgress = Math.min(100, Math.max(0, ((displayCompletedBursts * 100) / totalBursts).toInteger()))
-    }
-
-    Boolean scanComplete = (state.discoveryRunning != true && state.discoveryCompletedAt) || effectivelyAtEnd
-
-    if (scanComplete) {
-        runProgress = 100
-    }
-
-    Integer deviceCoverage = 0
-    String coverageText = ""
-
-    if (expectedCount > 0) {
-        deviceCoverage = Math.min(100, Math.max(0, ((cleanCount * 100) / expectedCount).toInteger()))
-        coverageText = "${cleanCount} of ${expectedCount} expected clean device(s) (${deviceCoverage}%)"
-    } else {
-        deviceCoverage = cleanCount > 0 ? 100 : 0
-        coverageText = "${cleanCount} clean device(s) found"
-    }
-
-    String runState = state.discoveryRunning == true && !effectivelyAtEnd ? "Discovery scan running" : (scanComplete ? "Discovery scan completed${state.discoveryCompletedAt ? ': ' + state.discoveryCompletedAt : ''}" : "Discovery scan not yet run")
-
-    StringBuilder builder = new StringBuilder()
-
-    builder << "<div style='font-size:14px;'>"
-    builder << "<p><b>${htmlEncode(runState)}</b></p>"
-
-    builder << "<table style='font-size:13px;border-collapse:collapse;'>"
-    builder << "<tr><td style='padding-right:20px;'><b>Usable clean devices</b></td><td>${cleanCount}</td></tr>"
-    if (expectedCount > 0) {
-        builder << "<tr><td style='padding-right:20px;'><b>Expected devices</b></td><td>${expectedCount}</td></tr>"
-    }
-    builder << "<tr><td style='padding-right:20px;'><b>Raw mDNS records</b></td><td>${rawCount}</td></tr>"
-    builder << "<tr><td style='padding-right:20px;'><b>Hidden unresolved records</b></td><td>${unresolvedCount}</td></tr>"
-    builder << "</table>"
-
-    builder << "<p style='margin-bottom:4px;'><b>Discovery run progress</b>: internal step ${displayCompletedBursts} of ${totalBursts} (${runProgress}%)"
-    if (scanComplete) {
-        builder << " - scan completed"
-    }
-    builder << "</p>"
-    builder << "<div style='background:#d9ecb1;border-radius:5px;width:100%;height:14px;margin-top:2px;margin-bottom:10px;'>"
-    builder << "<div style='background:#81bc00;border-radius:5px;width:${runProgress}%;height:14px;'>&nbsp;</div>"
-    builder << "</div>"
-
-    builder << "<p style='margin-bottom:4px;'><b>Device coverage</b>: ${coverageText}"
-    if (scanComplete && expectedCount > 0 && cleanCount < expectedCount) {
-        builder << " - scan completed, expected count not fully reached"
-    }
-    builder << "</p>"
-    builder << "<div style='background:#d7e8f7;border-radius:5px;width:100%;height:14px;margin-top:2px;margin-bottom:10px;'>"
-    builder << "<div style='background:#2f80c0;border-radius:5px;width:${deviceCoverage}%;height:14px;'>&nbsp;</div>"
-    builder << "</div>"
-
-    builder << "<p style='font-size:12px;margin-top:8px;'>"
-    builder << "<b>How discovery works:</b> the app advances a short visible staged scan designed to complete in about 5 seconds, optionally sends a short Google Cast mDNS probe, waits briefly, then reads Hubitat's mDNS device cache and lists records that resolve to a friendly Google Cast name and usable IP address. "
-    builder << "Other service records can be retained for diagnostics but are hidden from the clean device list."
-    builder << "</p>"
-
-    if (msg) {
-        builder << "<p style='font-size:12px;'><b>Last status:</b> ${htmlEncode(msg)}</p>"
-    }
-
-    if (state.lastError) {
-        builder << "<p style='font-size:12px;color:#8a1f11;'><b>Last error:</b> ${htmlEncode(state.lastError)}</p>"
-    }
-
-    builder << "</div>"
-
-    return builder.toString()
-}
-
-String buildDiscoveredDevicesHtml() {
-    Map visibleDevices = getVisibleDiscoveredDevices()
-    Map previousDevices = getPreviouslyDiscoveredDevices()
-    Map rawDiagnostics = getRawDiagnosticDevices()
-
-    Integer rawCount = state.discoveredDevices?.size() ?: 0
-    Integer unresolvedCount = rawDiagnostics?.size() ?: 0
-
-    if ((!visibleDevices || visibleDevices.size() == 0) && (!previousDevices || previousDevices.size() == 0)) {
-        if (rawCount > 0) {
-            return "No clean resolved Chromecast devices are currently visible. Raw mDNS records found: ${rawCount}. Hidden unresolved records: ${unresolvedCount}."
-        }
-        return "No discovered devices currently in the accumulated list."
-    }
-
-    StringBuilder builder = new StringBuilder()
-    builder << "<p><b>Clean resolved Chromecast devices: ${visibleDevices?.size() ?: 0}</b>"
-    builder << "<br><span style='font-size:12px'>Raw mDNS records retained internally: ${rawCount}. Hidden unresolved records: ${unresolvedCount}. Only records with both a friendly name and usable IP are shown below. Devices not found in the current run, or whose last seen timestamp is more than 1 hour old, are moved to the previous-discovery table and retained for 7 days.</span>"
-    builder << "</p>"
-
-    if (visibleDevices && visibleDevices.size() > 0) {
-        builder << "<table style='font-size:13px;border-collapse:collapse;table-layout:fixed;width:auto;white-space:nowrap;'>"
-        builder << getDeviceTableColgroupHtml(visibleDevices, previousDevices)
-        builder << "<tr><th align='left'>Name</th><th align='left'>IP</th><th align='left'>Port</th><th align='left'>Model</th><th align='left'>Type</th><th align='left'>Status</th><th align='left'>Last seen</th></tr>"
-
-        visibleDevices.sort { a, b -> compareIpAddress(a.value.ip?.toString(), b.value.ip?.toString()) ?: (a.value.name <=> b.value.name) }.each { key, item ->
-            builder << "<tr>"
-            builder << "<td>${htmlEncode(item.name)}</td>"
-            builder << "<td>${htmlEncode(item.ip ?: 'IP pending')}</td>"
-            builder << "<td>${htmlEncode(item.port ?: '')}</td>"
-            builder << "<td>${htmlEncode(item.model ?: 'Unknown')}</td>"
-            builder << "<td>${htmlEncode(item.type ?: 'Google Cast')}</td>"
-            builder << "<td>${htmlEncode(item.receiverStatus ?: item.status ?: '')}</td>"
-            builder << "<td>${htmlEncode(displayTimestampNoZone(item.lastSeenDuringDiscovery ?: item.lastActiveAt ?: item.discoveredAt ?: ''))}</td>"
-            builder << "</tr>"
-        }
-
-        builder << "</table>"
-    } else {
-        builder << "<p>No clean resolved Chromecast devices are currently active.</p>"
-    }
-
-    if (previousDevices && previousDevices.size() > 0) {
-        builder << "<p style='margin-top:14px;color:#888888;'><b>Previously discovered - records will be terminated one week after last discovery</b></p>"
-        builder << "<table style='font-size:13px;border-collapse:collapse;table-layout:fixed;width:auto;color:#888888;white-space:nowrap;'>"
-        builder << getDeviceTableColgroupHtml(visibleDevices, previousDevices)
-        builder << "<tr style='color:#888888;'><th align='left'>Name</th><th align='left'>IP</th><th align='left'>Port</th><th align='left'>Model</th><th align='left'>Type</th><th align='left'>Status</th><th align='left'>Last active</th></tr>"
-
-        previousDevices.sort { a, b -> compareIpAddress(a.value.ip?.toString(), b.value.ip?.toString()) ?: (a.value.name <=> b.value.name) }.each { key, item ->
-            builder << "<tr>"
-            builder << "<td>${htmlEncode(item.name)}</td>"
-            builder << "<td>${htmlEncode(item.ip ?: 'IP pending')}</td>"
-            builder << "<td>${htmlEncode(item.port ?: '')}</td>"
-            builder << "<td>${htmlEncode(item.model ?: 'Unknown')}</td>"
-            builder << "<td>${htmlEncode(item.type ?: 'Google Cast')}</td>"
-            builder << "<td>${htmlEncode(item.receiverStatus ?: item.status ?: '')}</td>"
-            builder << "<td>${htmlEncode(displayTimestampNoZone(item.lastActiveAt ?: item.lastSeenDuringDiscovery ?: item.discoveredAt ?: ''))}</td>"
-            builder << "</tr>"
-        }
-
-        builder << "</table>"
-    }
-
-    if (showUnresolvedMdnsRecords == true) {
-        builder << "<p><b>mDNS service sections, diagnostics only:</b></p>"
-        builder << "<table style='width:100%;font-size:12px;border-collapse:collapse;'>"
-        builder << "<tr><th align='left'>Service type</th><th align='left'>Declared</th><th align='left'>Parsed</th><th align='left'>Google Cast clean</th></tr>"
-
-        (state.mdnsSections ?: []).each { section ->
-            builder << "<tr>"
-            builder << "<td>${htmlEncode(section.serviceType ?: '')}</td>"
-            builder << "<td>${htmlEncode(section.declaredCount ?: '')}</td>"
-            builder << "<td>${htmlEncode(section.parsedCount ?: '')}</td>"
-            builder << "<td>${htmlEncode(section.cleanGoogleCastCount ?: 0)}</td>"
-            builder << "</tr>"
-        }
-
-        builder << "</table>"
-    }
-
-    return builder.toString()
-}
-
-String getDeviceTableColgroupHtml(Map visibleDevices, Map previousDevices) {
-    List<Integer> widths = getDeviceTableColumnWidths(visibleDevices, previousDevices)
-
-    StringBuilder b = new StringBuilder()
-    b << "<colgroup>"
-    widths.each { w ->
-        b << "<col style='width:${w}ch;'>"
-    }
-    b << "</colgroup>"
-    return b.toString()
-}
-
-List<Integer> getDeviceTableColumnWidths(Map visibleDevices, Map previousDevices) {
-    List<Integer> widths = ["Name", "IP", "Port", "Model", "Type", "Status", "Last active"].collect { it.length() }
-
-    Closure addItem = { Map item ->
-        if (!item) {
-            return
-        }
-
-        List values = [
-            item.name ?: "",
-            item.ip ?: "IP pending",
-            item.port ?: "",
-            item.model ?: "Unknown",
-            item.type ?: "Google Cast",
-            item.receiverStatus ?: item.status ?: "",
-            displayTimestampNoZone(item.lastActiveAt ?: item.lastSeenDuringDiscovery ?: item.discoveredAt ?: "")
-        ]
-
-        values.eachWithIndex { value, i ->
-            // Use the full rendered cell text for sizing, not the longest single word.
-            // Padding is added later so both tables keep the same column grid.
-            widths[i] = Math.max(widths[i], value?.toString()?.length() ?: 0)
-        }
-    }
-
-    (visibleDevices ?: [:]).each { key, item -> addItem(item as Map) }
-    (previousDevices ?: [:]).each { key, item -> addItem(item as Map) }
-
-    List<Integer> minimums = [16, 10, 5, 12, 12, 6, 16]
-
-    List<Integer> out = []
-    for (Integer i = 0; i < widths.size(); i++) {
-        out << Math.max(minimums[i], widths[i] + 3)
-    }
-
-    return out
-}
-
-String displayTimestampNoZone(value) {
-    String s = value?.toString() ?: ""
-    if (!s) {
-        return ""
-    }
-
-    s = s.trim().replaceAll(/\s+[A-Z]{2,5}$/, "")
-
-    // Display as yyyy-MM-dd HH:mm, leaving off seconds and timezone.
-    if (s ==~ /\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}/) {
-        return s.substring(0, 16)
-    }
-
-    return s
-}
-
-String getDiscoverySummaryText() {
-    Integer rawDiscovered = state.discoveredDevices?.size() ?: 0
-    Integer cleanDiscovered = getVisibleDiscoveredDevices()?.size() ?: 0
-    Integer previousDiscovered = getPreviouslyDiscoveredDevices()?.size() ?: 0
-    Integer unresolved = getUnresolvedRecordCount()
-    return "${cleanDiscovered} clean resolved device(s), ${previousDiscovered} previously discovered, ${rawDiscovered} raw mDNS record(s), ${unresolved} unresolved"
-}
-
-String buildSourceUrlHtml() {
-    String hubIp = getHubIpAddress()
-    String url = hubIp ? "http://${hubIp}:8080/hub/mdnsDevices/json" : "unavailable - hub IP not detected"
-
-    StringBuilder b = new StringBuilder()
-    b << "<table style='font-size:13px;border-collapse:collapse;width:100%;'>"
-    b << "<tr><td style='font-weight:bold;padding-right:10px;'>Detected hub IP</td><td style='font-family:monospace;'>${htmlEncode(hubIp ?: 'unknown')}</td></tr>"
-    b << "<tr><td style='font-weight:bold;padding-right:10px;'>Dynamic mDNS source</td><td style='font-family:monospace;'>${htmlEncode(url)}</td></tr>"
-    b << "<tr><td style='font-weight:bold;padding-right:10px;'>Last working source</td><td style='font-family:monospace;'>${htmlEncode(state.lastWorkingUrl ?: 'none yet')}</td></tr>"
-    b << "</table>"
-
-    return b.toString()
-}
-
-
-List getMdnsJsonUrlCandidates() {
+List<String> getMdnsEndpointCandidates() {
     String hubIp = getHubIpAddress()
 
     if (!hubIp) {
-        state.lastError = "Could not dynamically determine Hubitat hub IP address from location.hubs/location.hub."
+        state.lastError = 'Could not dynamically determine Hubitat hub IP address from location.hubs or location.hub.'
         return []
     }
 
-    return ["http://${hubIp}:8080/hub/mdnsDevices/json"]
-}
+    state.lastHubIp = hubIp
 
+    List<String> jsonFirst = [
+        "http://${hubIp}/hub/mdnsDevices/json",
+        "http://${hubIp}:8080/hub/mdnsDevices/json",
+        "http://${hubIp}/hub/mdnsDevices",
+        "http://${hubIp}:8080/hub/mdnsDevices"
+    ]
+
+    List<String> htmlFirst = [
+        "http://${hubIp}/hub/mdnsDevices",
+        "http://${hubIp}:8080/hub/mdnsDevices",
+        "http://${hubIp}/hub/mdnsDevices/json",
+        "http://${hubIp}:8080/hub/mdnsDevices/json"
+    ]
+
+    return preferJsonEndpoint == false ? htmlFirst.unique() : jsonFirst.unique()
+}
 
 String getHubIpAddress() {
     List candidates = []
 
     try {
-        def hubs = location?.hubs
-        hubs?.each { h ->
-            try {
-                if (h?.localIP) {
-                    candidates << h.localIP.toString()
-                }
-            } catch (Exception ignored) {}
+        location?.hubs?.each { h ->
+            try { if (h?.localIP) candidates << h.localIP.toString() } catch (Exception ignored) {}
+            try { if (h?.getDataValue('localIP')) candidates << h.getDataValue('localIP').toString() } catch (Exception ignored) {}
+            try { if (h?.getDataValue('localIp')) candidates << h.getDataValue('localIp').toString() } catch (Exception ignored) {}
         }
     } catch (Exception ignored) {}
 
-    try {
-        if (location?.hub?.localIP) {
-            candidates << location.hub.localIP.toString()
-        }
-    } catch (Exception ignored) {}
+    try { if (location?.hub?.localIP) candidates << location.hub.localIP.toString() } catch (Exception ignored) {}
+    try { if (location?.hub?.getDataValue('localIP')) candidates << location.hub.getDataValue('localIP').toString() } catch (Exception ignored) {}
+    try { if (location?.hub?.getDataValue('localIp')) candidates << location.hub.getDataValue('localIp').toString() } catch (Exception ignored) {}
 
-    try {
-        if (location?.hub?.getDataValue("localIP")) {
-            candidates << location.hub.getDataValue("localIP").toString()
-        }
-    } catch (Exception ignored) {}
-
-    candidates = candidates
-        .findAll { it && isValidSimpleIp(it.toString()) }
-        .collect { it.toString() }
-        .unique()
-
+    candidates = candidates.findAll { it && isValidSimpleIp(it.toString()) }.collect { it.toString() }.unique()
     return candidates ? candidates[0] : null
 }
 
-String inferDeviceType(Map d) {
-    String name = d.name?.toString()?.toLowerCase() ?: ""
-    String host = d.host?.toString()?.toLowerCase() ?: ""
-    String model = d.model?.toString()?.toLowerCase() ?: ""
-    String port = d.port?.toString() ?: ""
+String buildStatusHtml() {
+    Map current = state.currentDevices instanceof Map ? state.currentDevices : [:]
+    Map previous = getPreviouslyDiscovered()
+    StringBuilder b = new StringBuilder()
+    b << "<div style='font-size:13px;'>"
+    b << "<table style='font-size:13px;border-collapse:collapse;'>"
+    b << "<tr><td style='font-weight:bold;padding-right:18px;'>Detected hub IP</td><td>${htmlEncode(state.lastHubIp ?: getHubIpAddress() ?: 'unknown')}</td></tr>"
+    b << "<tr><td style='font-weight:bold;padding-right:18px;'>Current clean records</td><td>${current.size()}</td></tr>"
+    b << "<tr><td style='font-weight:bold;padding-right:18px;'>Previously discovered</td><td>${previous.size()}</td></tr>"
+    b << "<tr><td style='font-weight:bold;padding-right:18px;'>mDNS sections parsed</td><td>${state.mdnsSections?.size() ?: 0}</td></tr>"
+    b << "<tr><td style='font-weight:bold;padding-right:18px;'>Last successful source</td><td style='font-family:monospace;'>${htmlEncode(state.lastWorkingUrl ?: 'none yet')}</td></tr>"
+    b << "<tr><td style='font-weight:bold;padding-right:18px;'>Last run</td><td>${htmlEncode(state.lastRunAt ?: 'not yet')}</td></tr>"
+    b << "</table>"
 
-    if (port == "32026" || model.contains("cast group")) return "Cast Group"
-    if (name.contains("tv") || name.contains("google tv") || model.contains("google tv") || model == "chromecast") return "Google TV / Streamer"
-    if (name.contains("display") || host.contains("fuchsia") || model.contains("nest hub")) return "Smart Display"
-    if (name.contains("speaker") || model.contains("home") || model.contains("nest audio")) return "Speaker"
-    return "Google Cast"
+    b << "<p style='font-size:12px;'><b>Last message:</b> ${htmlEncode(state.lastMessage ?: '')}</p>"
+
+    if (state.lastError) {
+        b << "<p style='font-size:12px;color:#8a1f11;'><b>Last error:</b> ${htmlEncode(state.lastError ?: '')}</p>"
+    }
+
+    b << '</div>'
+    return b.toString()
 }
 
-String inferBadge(Map d) {
-    if (d.stale == true) return "STALE"
-    if (d.port?.toString() == "32026" || d.model?.toString()?.toLowerCase()?.contains("cast group")) return "GROUP"
-    return "FRESH"
+String buildDeviceTableHtml() {
+    Map current = state.currentDevices instanceof Map ? state.currentDevices : [:]
+    Map previous = getPreviouslyDiscovered()
+
+    StringBuilder b = new StringBuilder()
+
+    if (!current && !previous) {
+        return 'No Chromecast mDNS records discovered yet.'
+    }
+
+    if (current) {
+        b << "<p><b>Clean resolved Chromecast devices: ${current.size()}</b></p>"
+        b << buildTable(current, false)
+    } else {
+        b << '<p><b>Clean resolved Chromecast devices: 0</b></p>'
+    }
+
+    if (previous) {
+        b << "<p style='margin-top:14px;color:#888888;'><b>Previously discovered - retained for ${clampInt(safeInt(previousRetentionDays ?: 7), 1, 365)} day(s)</b></p>"
+        b << buildTable(previous, true)
+    }
+
+    if (showRawSections == true) {
+        b << '<p><b>mDNS service sections:</b></p>'
+        b << "<pre style='font-size:11px;white-space:pre-wrap;'>${htmlEncode(prettyValue(state.mdnsSections ?: []))}</pre>"
+    }
+
+    return b.toString()
 }
 
-Boolean isStaleLastUpdated(String s) {
-    Integer mins = minutesSinceLastUpdated(s)
-    if (mins == null) {
-        return false
+String buildTable(Map devices, Boolean faded) {
+    String colour = faded ? 'color:#888888;' : ''
+    StringBuilder b = new StringBuilder()
+
+    b << "<table style='font-size:13px;border-collapse:collapse;table-layout:auto;width:auto;white-space:nowrap;${colour}'>"
+    b << "<tr style='${colour}'><th align='left'>Name</th><th align='left'>IP</th><th align='left'>Port</th><th align='left'>Model</th><th align='left'>Type</th><th align='left'>Source</th><th align='left'>Last seen</th></tr>"
+
+    devices.sort { a, c -> compareIpAddress(a.value.ip?.toString(), c.value.ip?.toString()) ?: (a.value.name <=> c.value.name) }.each { key, item ->
+        b << '<tr>'
+        b << "<td style='padding-right:18px;'>${htmlEncode(item.name ?: '')}</td>"
+        b << "<td style='padding-right:18px;'>${htmlEncode(item.ip ?: '')}</td>"
+        b << "<td style='padding-right:18px;'>${htmlEncode(item.port ?: '')}</td>"
+        b << "<td style='padding-right:18px;'>${htmlEncode(item.model ?: '')}</td>"
+        b << "<td style='padding-right:18px;'>${htmlEncode(item.type ?: '')}</td>"
+        b << "<td style='padding-right:18px;'>${htmlEncode(item.source ?: '')}</td>"
+        b << "<td style='padding-right:18px;'>${htmlEncode(displayTimestamp(item.lastSeen ?: item.lastUpdated ?: item.lastActiveAt ?: item.discoveredAt ?: ''))}</td>"
+        b << '</tr>'
     }
-    return mins > getStaleAfterMinutes()
+
+    b << '</table>'
+    return b.toString()
 }
 
-Integer minutesSinceLastUpdated(String s) {
-    Date d = parseHubitatTimestamp(s)
-    if (!d) {
-        return null
-    }
+String buildSourceHtml() {
+    String hubIp = getHubIpAddress()
+    List urls = getMdnsEndpointCandidates()
+    StringBuilder b = new StringBuilder()
 
-    Long diffMs = new Date().time - d.time
-    if (diffMs < 0) {
-        return 0
-    }
+    b << "<table style='font-size:13px;border-collapse:collapse;width:100%;'>"
+    b << "<tr><td style='font-weight:bold;padding-right:10px;'>Detected hub IP</td><td style='font-family:monospace;'>${htmlEncode(hubIp ?: 'unknown')}</td></tr>"
+    b << "<tr><td style='font-weight:bold;padding-right:10px;'>Preferred endpoint order</td><td style='font-family:monospace;'>${htmlEncode(urls.join(' | '))}</td></tr>"
+    b << "<tr><td style='font-weight:bold;padding-right:10px;'>Last working source</td><td style='font-family:monospace;'>${htmlEncode(state.lastWorkingUrl ?: 'none yet')}</td></tr>"
+    b << '</table>'
 
-    return (diffMs / 60000L).toInteger()
-}
-
-Date parseHubitatTimestamp(String s) {
-    if (!s) {
-        return null
-    }
-
-    String value = s.toString().trim()
-    if (!value) {
-        return null
-    }
-
-    List patterns = [
-        "yyyy-MM-dd HH:mm:ss z",
-        "yyyy-MM-dd HH:mm z",
-        "yyyy-MM-dd HH:mm:ss",
-        "yyyy-MM-dd HH:mm"
-    ]
-
-    for (String p in patterns) {
-        try {
-            return Date.parse(p, value)
-        } catch (Exception ignored) {}
-    }
-
-    return null
-}
-
-Integer getExpectedCleanDeviceCount() {
-    Integer count = safeInt(expectedCleanDeviceCount ?: 15)
-    if (count < 0) {
-        return 0
-    }
-    if (count > 200) {
-        return 200
-    }
-    return count
-}
-
-Integer getStaleAfterMinutes() {
-    Integer minutes = safeInt(staleAfterMinutes ?: 120)
-    if (minutes < 1) {
-        return 1
-    }
-    if (minutes > 10080) {
-        return 10080
-    }
-    return minutes
-}
-
-Integer getPreScanProbeBursts() {
-    Integer n = safeInt(preScanProbeBursts ?: 2)
-    if (n < 0) {
-        return 0
-    }
-    if (n > 50) {
-        return 50
-    }
-    return n
-}
-
-Integer getPreScanPauseMs() {
-    Integer ms = safeInt(preScanPauseMs ?: 500)
-    if (ms < 50) {
-        return 50
-    }
-    if (ms > 2000) {
-        return 2000
-    }
-    return ms
-}
-
-Integer getPreScanLateWaitMs() {
-    Integer ms = safeInt(preScanLateWaitMs ?: 1000)
-    if (ms < 100) {
-        return 100
-    }
-    if (ms > 15000) {
-        return 15000
-    }
-    return ms
-}
-
-Integer getDiscoveryRefreshSeconds() {
-    Integer seconds = safeInt(discoveryRefreshSeconds ?: 1)
-    if (seconds < 1) {
-        return 1
-    }
-    if (seconds > 60) {
-        return 60
-    }
-    return seconds
+    return b.toString()
 }
 
 String cleanupName(String s) {
-    if (!s) {
-        return ""
-    }
-
-    String v = s.trim().replaceAll(/\s+/, " ")
-    v = v.replaceAll(/\s+@\s+.*?\.local\.?$/, "")
+    if (!s) return ''
+    String v = htmlDecode(s)
+    v = v.replaceAll(/\s+/, ' ').trim()
+    v = v.replaceAll(/\s*@\s*.*?\.local\.?$/, '').trim()
     return v
 }
 
-String cleanupHost(String s) {
-    if (!s) {
-        return ""
-    }
+String extractHostFromName(String s) {
+    if (!s) return ''
+    def m = s =~ /@\s*([^\s]+\.local\.?)/
+    if (m.find()) return cleanupHost(m.group(1))
+    return ''
+}
 
-    return s.trim().replaceAll(/\s+/, "")
+String cleanupHost(String s) {
+    if (!s) return ''
+    return s.replaceAll(/\s+/, '').replaceAll(/\.$/, '')
 }
 
 String cleanupService(String s) {
-    if (!s) return ""
-    return s.trim().replaceAll(/\.$/, "")
+    if (!s) return ''
+    return s.trim().replaceAll(/\.$/, '')
 }
 
-Object firstNonNull(Object... values) {
+String cleanupIp(String s) {
+    if (!s) return ''
+    def m = s =~ /(\d{1,3}(?:\.\d{1,3}){3})/
+    if (m.find()) return m.group(1)
+    return ''
+}
+
+String inferModelFromText(String name, String host) {
+    String n = "${name ?: ''} ${host ?: ''}".toLowerCase()
+    if (n.contains('speakers') || n.contains('group')) return 'Google Cast Group'
+    if (n.contains('nest hub max')) return 'Google Nest Hub Max'
+    if (n.contains('display') || n.contains('fuchsia')) return 'Google Nest Hub'
+    if (n.contains('google tv') || n.contains('chromecast') || n.contains('tv')) return 'Google TV / Streamer'
+    if (n.contains('nest audio')) return 'Nest Audio'
+    if (n.contains('speaker') || n.contains('home mini')) return 'Google Home / Nest Speaker'
+    if (n.contains('home')) return 'Google Home'
+    return 'Google Cast Device'
+}
+
+String inferDeviceType(Map d) {
+    String name = d.name?.toString()?.toLowerCase() ?: ''
+    String host = d.host?.toString()?.toLowerCase() ?: ''
+    String model = d.model?.toString()?.toLowerCase() ?: ''
+    String port = d.port?.toString() ?: ''
+
+    if (port == '32026' || model.contains('cast group') || name.contains('speakers')) return 'Cast Group'
+    if (name.contains('tv') || model.contains('tv') || model.contains('streamer') || model.contains('chromecast')) return 'Google TV / Streamer'
+    if (name.contains('display') || host.contains('fuchsia') || model.contains('hub')) return 'Smart Display'
+    if (name.contains('speaker') || model.contains('speaker') || model.contains('home') || model.contains('audio')) return 'Speaker'
+    return 'Google Cast'
+}
+
+Map firstMap(Object... values) {
     for (Object v in values) {
-        if (v != null) return v
+        if (v instanceof Map) return v as Map
     }
-    return null
+    return [:]
 }
 
 String stringFirst(Object... values) {
-    Object v = firstNonNull(values)
-    return v == null ? "" : v.toString()
+    for (Object v in values) {
+        if (v != null) {
+            String s = v.toString()
+            if (s) return s
+        }
+    }
+    return ''
 }
 
-Integer safeNullableInt(value) {
-    if (value == null) return null
-    try {
-        return value as Integer
-    } catch (Exception ignored) {
-        return null
-    }
+String stripHtml(String s) {
+    if (!s) return ''
+    return htmlDecode(s.replaceAll(/(?is)<script.*?<\/script>/, ' ').replaceAll(/(?is)<style.*?<\/style>/, ' ').replaceAll(/<br\s*\/?>/, ' ').replaceAll(/<[^>]+>/, ' '))
 }
 
-String sanitizeKey(value) {
-    String s = value?.toString() ?: "unknown"
-    s = s.toLowerCase()
-    s = s.replaceAll("[^a-z0-9]+", "-")
-    s = s.replaceAll("^-+", "")
-    s = s.replaceAll("-+\$", "")
-
-    if (!s) {
-        s = "unknown"
-    }
-
-    if (s.length() > 80) {
-        s = s.substring(0, 80)
-    }
-
-    return s
+String htmlEncode(Object value) {
+    return value?.toString()?.replace('&', '&amp;')?.replace('<', '&lt;')?.replace('>', '&gt;')?.replace('"', '&quot;') ?: ''
 }
 
-String makeDni(String ip, String port = "") {
-    String p = port ? "-${port}" : ""
-    return "castmon-${ip.replace('.', '-')}${p}"
+String htmlDecode(String value) {
+    if (!value) return ''
+    return value
+        .replace('&nbsp;', ' ')
+        .replace('&amp;', '&')
+        .replace('&lt;', '<')
+        .replace('&gt;', '>')
+        .replace('&quot;', '"')
+        .replace('&#39;', "'")
+}
+
+String sanitizeKey(Object value) {
+    String s = value?.toString()?.toLowerCase() ?: 'unknown'
+    s = s.replaceAll(/[^a-z0-9]+/, '-')
+    s = s.replaceAll(/^-+/, '').replaceAll(/-+$/, '')
+    if (!s) s = 'unknown'
+    return s.length() > 100 ? s.substring(0, 100) : s
 }
 
 Boolean isValidSimpleIp(String ip) {
-    def parts = ip?.split("\\.")
-    if (parts?.size() != 4) {
-        return false
-    }
-
-    for (p in parts) {
+    if (!ip) return false
+    def parts = ip.split(/\./)
+    if (parts.size() != 4) return false
+    for (String p in parts) {
+        if (!(p ==~ /\d{1,3}/)) return false
         Integer n = safeInt(p)
-        if (n < 0 || n > 255) {
-            return false
-        }
+        if (n < 0 || n > 255) return false
     }
-
     return true
 }
 
 Integer compareIpAddress(String leftIp, String rightIp) {
-    List leftParts = ipToSortableParts(leftIp)
-    List rightParts = ipToSortableParts(rightIp)
-
+    List left = ipParts(leftIp)
+    List right = ipParts(rightIp)
     for (Integer i = 0; i < 4; i++) {
-        Integer result = leftParts[i] <=> rightParts[i]
-        if (result != 0) {
-            return result
-        }
+        Integer r = left[i] <=> right[i]
+        if (r != 0) return r
     }
-
     return 0
 }
 
-List ipToSortableParts(String ip) {
-    if (!ip || !isValidSimpleIp(ip)) {
-        return [999, 999, 999, 999]
-    }
-
-    return ip.split("\\.").collect { safeInt(it) }
+List ipParts(String ip) {
+    if (!isValidSimpleIp(ip)) return [999, 999, 999, 999]
+    return ip.split(/\./).collect { safeInt(it) }
 }
 
-Long timestampToMs(String s) {
-    Date d = parseHubitatTimestamp(s)
-    return d ? d.time : 0L
+Integer safeInt(Object value) {
+    if (value == null) return 0
+    try { return value as Integer } catch (Exception ignored) { return 0 }
 }
 
-String formatDateTimeFromMs(Long ms) {
-    if (!ms || ms <= 0L) {
-        return ""
-    }
-
-    return new Date(ms).format("yyyy-MM-dd HH:mm:ss", location.timeZone)
+Integer safeNullableInt(Object value) {
+    if (value == null) return null
+    try { return value as Integer } catch (Exception ignored) { return null }
 }
 
-Long getPreviouslyDiscoveredAfterMs() {
-    return 60L * 60L * 1000L
+Long safeLong(Object value) {
+    if (value == null) return 0L
+    try { return value as Long } catch (Exception ignored) { return 0L }
 }
 
-Long getHistoryRetentionMs() {
-    return 7L * 24L * 60L * 60L * 1000L
+Integer clampInt(Integer value, Integer min, Integer max) {
+    return Math.max(min, Math.min(max, value ?: 0))
 }
 
 Long nowMs() {
     return new Date().time
 }
 
-Long safeLong(value) {
-    try {
-        return value as Long
-    } catch (Exception ignored) {
-        return 0L
-    }
-}
-
-Integer safeInt(value) {
-    try {
-        return value as Integer
-    } catch (Exception ignored) {
-        return 0
-    }
-}
-
 String formatNow() {
-    return new Date().format("yyyy-MM-dd HH:mm:ss", location.timeZone)
+    return new Date().format('yyyy-MM-dd HH:mm:ss', location.timeZone)
 }
 
-String htmlEncode(value) {
-    return value?.toString()
-        ?.replace("&", "&amp;")
-        ?.replace("<", "&lt;")
-        ?.replace(">", "&gt;")
-        ?: ""
+String displayTimestamp(Object value) {
+    String s = value?.toString() ?: ''
+    s = s.trim().replaceAll(/\s+[A-Z]{2,5}$/, '')
+    if (s ==~ /\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}/) return s.substring(0, 16)
+    return s
 }
 
-String toPrettyText(value) {
-    if (value == null) {
-        return ""
-    }
-
+String prettyValue(Object value) {
+    if (value == null) return ''
     if (value instanceof Map) {
         StringBuilder b = new StringBuilder()
-        value.each { k, v ->
-            b << "${k}: ${v}\n"
-        }
+        (value as Map).each { k, v -> b << "${k}: ${v}\n" }
         return b.toString()
     }
-
     if (value instanceof List) {
         StringBuilder b = new StringBuilder()
-        value.eachWithIndex { item, i ->
-            b << "${i + 1}. ${item}\n"
-        }
+        (value as List).eachWithIndex { item, i -> b << "${i + 1}. ${item}\n" }
         return b.toString()
     }
-
     return value.toString()
 }
 
 String trimForStorage(String s, Integer maxLen) {
-    if (!s) {
-        return ""
-    }
-
-    if (s.length() <= maxLen) {
-        return s
-    }
-
+    if (!s) return ''
+    if (s.length() <= maxLen) return s
     return s.substring(0, maxLen) + "\n\n... trimmed at ${maxLen} characters ..."
 }

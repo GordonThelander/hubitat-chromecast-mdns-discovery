@@ -1,7 +1,7 @@
 /**
  *  Chromecast mDNS Discovery
  *
- *  Version: 1.1.0
+ *  Version: 1.2.0
  *  Author: Gordon Thelander
  *  Platform: Hubitat Elevation
  *
@@ -10,10 +10,10 @@
  *  
  *  Design goals:
  *  - Dynamically detect the Hubitat hub IP address.
- *  - mDNS multicast probe packet pulses to 224.0.0.251:5353 to attempt to wake dormant decices 
+ *  - Fires off mDNS multicast discovery probe packet pulses to 224.0.0.251:5353 to wake dormant devices 
  *  - Read Hubitat's own mDNS cache from /hub/mdnsDevices and /hub/mdnsDevices/json.
  *  - Prefer JSON when available, but fall back to parsing the HTML table shown by Hubitat.
- *  - Display only clean Google Cast / Chromecast records with friendly name, IP and port.
+ *  - Display only clean Google Cast / Chromecast records with friendly name, IP:port as well as current Receiver Status
  *  - Keep a short history of previously discovered devices without polluting the current list.
  *  - Does not create child devices and does not control Chromecast devices.
  */
@@ -21,7 +21,7 @@
 import groovy.json.JsonSlurper
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = '2.0.5'
+@Field static final String APP_VERSION = '1.2.0'
 @Field static final String GOOGLECAST_SERVICE = '_googlecast._tcp.local'
 @Field static final String GOOGLEZONE_SERVICE = '_googlezone._tcp.local'
 @Field static final String SERVICES_SERVICE = '_services._dns-sd._udp.local'
@@ -980,7 +980,7 @@ String buildDeviceTableHtml() {
 
 List<Integer> getDeviceTableColumnWidths(Map current, Map previous) {
     // Same colgroup is used for current and previous tables so columns line up exactly.
-    List<Integer> widths = [32, 13, 7, 22, 20, 11, 17]
+    List<Integer> widths = [32, 13, 7, 22, 20, 12, 11, 17]
 
     Closure addItem = { Map item ->
         if (!item) return
@@ -991,6 +991,7 @@ List<Integer> getDeviceTableColumnWidths(Map current, Map previous) {
             item.port ?: '',
             item.model ?: '',
             item.type ?: '',
+            displayStatus(item),
             item.source ?: '',
             displayTimestamp(item.lastSeen ?: item.lastUpdated ?: item.lastActiveAt ?: item.discoveredAt ?: '')
         ]
@@ -1008,14 +1009,14 @@ List<Integer> getDeviceTableColumnWidths(Map current, Map previous) {
 }
 
 Integer getMaxColumnWidth(Integer idx) {
-    List<Integer> maxes = [48, 15, 8, 26, 24, 14, 18]
+    List<Integer> maxes = [48, 15, 8, 26, 24, 16, 14, 18]
     return maxes[idx]
 }
 
 String buildColgroupHtml(List<Integer> widths) {
     StringBuilder b = new StringBuilder()
     b << '<colgroup>'
-    (widths ?: [32, 13, 7, 22, 20, 11, 17]).each { Integer w ->
+    (widths ?: [32, 13, 7, 22, 20, 12, 11, 17]).each { Integer w ->
         b << "<col style='width:${w}ch;'>"
     }
     b << '</colgroup>'
@@ -1028,7 +1029,7 @@ String buildTable(Map devices, Boolean faded, List<Integer> widths) {
 
     b << "<table style='font-size:13px;border-collapse:collapse;table-layout:fixed;width:auto;white-space:nowrap;${colour}'>"
     b << buildColgroupHtml(widths)
-    b << "<tr style='${colour}'><th align='left'>Name</th><th align='left'>IP</th><th align='left'>Port</th><th align='left'>Model</th><th align='left'>Type</th><th align='left'>Source</th><th align='left'>Last seen</th></tr>"
+    b << "<tr style='${colour}'><th align='left'>Name</th><th align='left'>IP</th><th align='left'>Port</th><th align='left'>Model</th><th align='left'>Type</th><th align='left'>Status</th><th align='left'>Source</th><th align='left'>Last seen</th></tr>" 
 
     devices.sort { a, c -> compareIpAddress(a.value.ip?.toString(), c.value.ip?.toString()) ?: (a.value.name <=> c.value.name) }.each { key, item ->
         b << '<tr>'
@@ -1037,6 +1038,7 @@ String buildTable(Map devices, Boolean faded, List<Integer> widths) {
         b << deviceCell(item.port ?: '')
         b << deviceCell(item.model ?: '')
         b << deviceCell(item.type ?: '')
+        b << deviceCell(displayStatus(item))
         b << deviceCell(item.source ?: '')
         b << deviceCell(displayTimestamp(item.lastSeen ?: item.lastUpdated ?: item.lastActiveAt ?: item.discoveredAt ?: ''))
         b << '</tr>'
@@ -1044,6 +1046,16 @@ String buildTable(Map devices, Boolean faded, List<Integer> widths) {
 
     b << '</table>'
     return b.toString()
+}
+
+String displayStatus(Map item) {
+    String receiver = item?.receiverStatus?.toString() ?: ''
+    String status = item?.status?.toString() ?: ''
+
+    if (receiver) return receiver
+    if (status) return status
+
+    return ''
 }
 
 String deviceCell(Object value) {

@@ -1,13 +1,13 @@
 /**
  *  Chromecast mDNS Discovery
  *
- *  Version: 1.0.2
+ *  Version: 1.1.0
  *  Author: Gordon Thelander
  *  Platform: Hubitat Elevation
  *
  *  Purpose:
  *  Discovery-style Hubitat app for Google Cast / Chromecast devices.
- *
+ *  
  *  Design goals:
  *  - Dynamically detect the Hubitat hub IP address.
  *  - mDNS multicast probe packet pulses to 224.0.0.251:5353 to attempt to wake dormant decices 
@@ -21,7 +21,7 @@
 import groovy.json.JsonSlurper
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = '2.0.4'
+@Field static final String APP_VERSION = '2.0.5'
 @Field static final String GOOGLECAST_SERVICE = '_googlecast._tcp.local'
 @Field static final String GOOGLEZONE_SERVICE = '_googlezone._tcp.local'
 @Field static final String SERVICES_SERVICE = '_services._dns-sd._udp.local'
@@ -460,8 +460,7 @@ void parseEndpointListForService(String serviceType, List endpoints, Map devices
         if (item.name || item.ip || item.host) parsedCount++
 
         if (isGoogleCastService(svc, item) && isCleanDevice(item)) {
-            String key = makeDeviceKey(item)
-            devices[key] = item + [key: key]
+            addOrMergeDevice(devices, item)
             cleanCastCount++
         }
     }
@@ -566,8 +565,7 @@ Map parseMdnsHtml(String html) {
 
         Map item = parseHtmlDeviceRow(row, currentService)
         if (isCleanDevice(item)) {
-            String key = makeDeviceKey(item)
-            devices[key] = item + [key: key]
+            addOrMergeDevice(devices, item)
             Map stats = ensureSectionStats(sectionStats, currentService)
             stats.parsedCount = safeInt(stats.parsedCount) + 1
             stats.cleanGoogleCastCount = safeInt(stats.cleanGoogleCastCount) + 1
@@ -619,8 +617,7 @@ void parseHtmlByLines(String html, String serviceType, Map devices, Map sectionS
 
         Map item = makeHtmlItem(name, ip, port, '', svc)
         if (isCleanDevice(item)) {
-            String key = makeDeviceKey(item)
-            devices[key] = item + [key: key]
+            addOrMergeDevice(devices, item)
             stats.parsedCount = safeInt(stats.parsedCount) + 1
             stats.cleanGoogleCastCount = safeInt(stats.cleanGoogleCastCount) + 1
         }
@@ -708,15 +705,91 @@ Boolean isBadName(String name) {
     if (n.contains('_googlecast._tcp.local')) return true
     if (n.contains('_googlezone._tcp.local')) return true
     if (n == 'google cast device' || n == 'google cast / dial') return true
+
+    // Hubitat sometimes exposes raw Cast group instance names alongside the friendly
+    // group name, for example Google-Cast-Group-8ce0a... . Those are duplicate
+    // records, not user-friendly devices, so do not show them in the clean list.
+    if (n ==~ /google[- ]cast[- ]group[- ][a-f0-9-]{12,}/) return true
+    if (n ==~ /[a-f0-9]{16,}/) return true
+    if (n ==~ /[0-9a-f]{8}[- ][0-9a-f]{4}[- ][0-9a-f]{4}.*/) return true
+
     return false
 }
 
+String endpointKey(Map item) {
+    String ip = item?.ip?.toString() ?: ''
+    String port = item?.port?.toString() ?: ''
+
+    if (isValidSimpleIp(ip) && port) {
+        return "${ip}:${port}"
+    }
+
+    return ''
+}
+
 String makeDeviceKey(Map item) {
-    String id = item.mdnsId ?: ''
+    // Prefer endpoint identity so duplicate JSON records with different instance IDs
+    // collapse into one displayed row. This fixes Cast group duplicates where Hubitat
+    // reports both a friendly group name and a raw Google-Cast-Group-* instance name.
+    String ep = endpointKey(item)
+    if (ep) return "cast-${sanitizeKey(ep)}"
+
+    String id = item?.mdnsId ?: ''
     if (id) return "cast-${sanitizeKey(id)}"
 
-    String basis = "${item.name ?: 'cast'}-${item.ip ?: 'ip'}-${item.port ?: 'port'}"
+    String basis = "${item?.name ?: 'cast'}-${item?.host ?: 'host'}"
     return "cast-${sanitizeKey(basis)}"
+}
+
+void addOrMergeDevice(Map devices, Map item) {
+    if (!isCleanDevice(item)) return
+
+    String key = makeDeviceKey(item)
+    Map candidate = item + [key: key]
+    Map existing = devices[key] instanceof Map ? devices[key] as Map : null
+
+    devices[key] = choosePreferredDevice(existing, candidate)
+}
+
+Map choosePreferredDevice(Map existing, Map candidate) {
+    if (!existing) return candidate
+    if (!candidate) return existing
+
+    Integer existingScore = deviceDisplayScore(existing)
+    Integer candidateScore = deviceDisplayScore(candidate)
+
+    if (candidateScore > existingScore) return existing + candidate
+
+    // Keep the stronger display row, but fill any missing metadata from the other row.
+    Map merged = candidate + existing
+    merged.lastSeen = latestTimestamp(existing.lastSeen, candidate.lastSeen)
+    merged.lastUpdated = latestTimestamp(existing.lastUpdated, candidate.lastUpdated)
+    return merged
+}
+
+Integer deviceDisplayScore(Map item) {
+    Integer score = 0
+    String name = item?.name?.toString() ?: ''
+    String model = item?.model?.toString() ?: ''
+    String source = item?.source?.toString() ?: ''
+
+    if (name && !isBadName(name)) score += 100
+    if (name && !(name.toLowerCase() ==~ /google[- ]cast[- ]group[- ].*/)) score += 40
+    if (model && model != 'Google Cast Device') score += 10
+    if (source.contains('JSON')) score += 5
+    if (item?.lastSeen || item?.lastUpdated) score += 2
+
+    return score
+}
+
+String latestTimestamp(Object a, Object b) {
+    String sa = a?.toString() ?: ''
+    String sb = b?.toString() ?: ''
+    Long ma = timestampToMs(sa)
+    Long mb = timestampToMs(sb)
+
+    if (mb > ma) return sb ?: sa
+    return sa ?: sb
 }
 
 void mergeIntoHistory(Map devices) {
@@ -760,9 +833,22 @@ Map getPreviouslyDiscovered() {
     Map current = state.currentDevices instanceof Map ? state.currentDevices : [:]
     Map history = state.deviceHistory instanceof Map ? state.deviceHistory : [:]
     Map previous = [:]
+    List currentEndpoints = []
+
+    current.each { key, item ->
+        String ep = endpointKey(item as Map)
+        if (ep) currentEndpoints << ep
+    }
 
     history.each { key, item ->
-        if (!current.containsKey(key)) previous[key] = item
+        if (!(item instanceof Map)) return
+        if (!isCleanDevice(item as Map)) return
+        if (current.containsKey(key)) return
+
+        String ep = endpointKey(item as Map)
+        if (ep && currentEndpoints.contains(ep)) return
+
+        previous[key] = item
     }
 
     return previous
@@ -870,16 +956,18 @@ String buildDeviceTableHtml() {
         return 'No Chromecast mDNS records discovered yet.'
     }
 
+    List<Integer> widths = getDeviceTableColumnWidths(current, previous)
+
     if (current) {
         b << "<p><b>Clean resolved Chromecast devices: ${current.size()}</b></p>"
-        b << buildTable(current, false)
+        b << buildTable(current, false, widths)
     } else {
         b << '<p><b>Clean resolved Chromecast devices: 0</b></p>'
     }
 
     if (previous) {
         b << "<p style='margin-top:14px;color:#888888;'><b>Previously discovered - retained for ${clampInt(safeInt(previousRetentionDays ?: 7), 1, 365)} day(s)</b></p>"
-        b << buildTable(previous, true)
+        b << buildTable(previous, true, widths)
     }
 
     if (showRawSections == true) {
@@ -890,27 +978,76 @@ String buildDeviceTableHtml() {
     return b.toString()
 }
 
-String buildTable(Map devices, Boolean faded) {
+List<Integer> getDeviceTableColumnWidths(Map current, Map previous) {
+    // Same colgroup is used for current and previous tables so columns line up exactly.
+    List<Integer> widths = [32, 13, 7, 22, 20, 11, 17]
+
+    Closure addItem = { Map item ->
+        if (!item) return
+
+        List values = [
+            item.name ?: '',
+            item.ip ?: '',
+            item.port ?: '',
+            item.model ?: '',
+            item.type ?: '',
+            item.source ?: '',
+            displayTimestamp(item.lastSeen ?: item.lastUpdated ?: item.lastActiveAt ?: item.discoveredAt ?: '')
+        ]
+
+        values.eachWithIndex { value, Integer idx ->
+            Integer len = value?.toString()?.length() ?: 0
+            widths[idx] = Math.max(widths[idx], Math.min(len + 2, getMaxColumnWidth(idx)))
+        }
+    }
+
+    (current ?: [:]).each { key, item -> addItem(item as Map) }
+    (previous ?: [:]).each { key, item -> addItem(item as Map) }
+
+    return widths
+}
+
+Integer getMaxColumnWidth(Integer idx) {
+    List<Integer> maxes = [48, 15, 8, 26, 24, 14, 18]
+    return maxes[idx]
+}
+
+String buildColgroupHtml(List<Integer> widths) {
+    StringBuilder b = new StringBuilder()
+    b << '<colgroup>'
+    (widths ?: [32, 13, 7, 22, 20, 11, 17]).each { Integer w ->
+        b << "<col style='width:${w}ch;'>"
+    }
+    b << '</colgroup>'
+    return b.toString()
+}
+
+String buildTable(Map devices, Boolean faded, List<Integer> widths) {
     String colour = faded ? 'color:#888888;' : ''
     StringBuilder b = new StringBuilder()
 
-    b << "<table style='font-size:13px;border-collapse:collapse;table-layout:auto;width:auto;white-space:nowrap;${colour}'>"
+    b << "<table style='font-size:13px;border-collapse:collapse;table-layout:fixed;width:auto;white-space:nowrap;${colour}'>"
+    b << buildColgroupHtml(widths)
     b << "<tr style='${colour}'><th align='left'>Name</th><th align='left'>IP</th><th align='left'>Port</th><th align='left'>Model</th><th align='left'>Type</th><th align='left'>Source</th><th align='left'>Last seen</th></tr>"
 
     devices.sort { a, c -> compareIpAddress(a.value.ip?.toString(), c.value.ip?.toString()) ?: (a.value.name <=> c.value.name) }.each { key, item ->
         b << '<tr>'
-        b << "<td style='padding-right:18px;'>${htmlEncode(item.name ?: '')}</td>"
-        b << "<td style='padding-right:18px;'>${htmlEncode(item.ip ?: '')}</td>"
-        b << "<td style='padding-right:18px;'>${htmlEncode(item.port ?: '')}</td>"
-        b << "<td style='padding-right:18px;'>${htmlEncode(item.model ?: '')}</td>"
-        b << "<td style='padding-right:18px;'>${htmlEncode(item.type ?: '')}</td>"
-        b << "<td style='padding-right:18px;'>${htmlEncode(item.source ?: '')}</td>"
-        b << "<td style='padding-right:18px;'>${htmlEncode(displayTimestamp(item.lastSeen ?: item.lastUpdated ?: item.lastActiveAt ?: item.discoveredAt ?: ''))}</td>"
+        b << deviceCell(item.name ?: '')
+        b << deviceCell(item.ip ?: '')
+        b << deviceCell(item.port ?: '')
+        b << deviceCell(item.model ?: '')
+        b << deviceCell(item.type ?: '')
+        b << deviceCell(item.source ?: '')
+        b << deviceCell(displayTimestamp(item.lastSeen ?: item.lastUpdated ?: item.lastActiveAt ?: item.discoveredAt ?: ''))
         b << '</tr>'
     }
 
     b << '</table>'
     return b.toString()
+}
+
+String deviceCell(Object value) {
+    return "<td style='padding-right:18px;overflow:hidden;text-overflow:ellipsis;'>${htmlEncode(value ?: '')}</td>"
 }
 
 String buildSourceHtml() {
@@ -1081,6 +1218,27 @@ Long nowMs() {
 
 String formatNow() {
     return new Date().format('yyyy-MM-dd HH:mm:ss', location.timeZone)
+}
+
+
+Long timestampToMs(Object value) {
+    String s = value?.toString()?.trim() ?: ''
+    if (!s) return 0L
+
+    List<String> patterns = [
+        'yyyy-MM-dd HH:mm:ss z',
+        'yyyy-MM-dd HH:mm z',
+        'yyyy-MM-dd HH:mm:ss',
+        'yyyy-MM-dd HH:mm'
+    ]
+
+    for (String p in patterns) {
+        try {
+            return Date.parse(p, s).time
+        } catch (Exception ignored) {}
+    }
+
+    return 0L
 }
 
 String displayTimestamp(Object value) {

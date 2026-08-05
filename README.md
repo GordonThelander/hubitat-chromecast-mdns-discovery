@@ -1,66 +1,44 @@
-# Chromecast mDNS Discovery for Hubitat
+# mDNS Device Discovery for Hubitat
 
-A discovery-style Hubitat app for finding Google Cast / Chromecast devices using and mDNS scan plus Hubitat's own internal mDNS cache.
-
+A discovery-style Hubitat app for finding Google Cast / Chromecast, Philips Hue Bridge, and Matter devices using an mDNS scan plus Hubitat's own internal mDNS cache.
 
 The hub IP is detected dynamically from the Hubitat runtime.
 
 ## What it does
 
 - Sends Google Cast mDNS pulses to stimulate device responses.
-- Waits briefly for Hubitat's internal mDNS cache to update.
-- Reads Hubitat's internal mDNS JSON endpoint.
-- Parses `_googlecast._tcp.local` endpoints from `http://<hub-ip>:8080/hub/mdnsDevices/json`.
-- Displays clean resolved Chromecast / Google Cast devices.
-- Shows progress and expected-device coverage.
+- Reads Hubitat's internal mDNS cache, preferring `http://<hub-ip>:8080/hub/mdnsDevices/json` and falling back to the HTML page.
+- Parses `_googlecast._tcp.local`, `_hue._tcp.local`, and `_matter._tcp.local` endpoints.
+- Displays clean resolved Chromecast devices (with model, type, and receiver status), Hue Bridge records, and Matter records (with MAC, vendor, and a "Known As" name).
+- Looks up a device's manufacturer from its MAC OUI for a small set of verified vendor prefixes, or infers a brand from its "Known As" name when the MAC is a randomized/locally-administered address (e.g. Android TV's per-network MAC randomization).
+- Optionally cross-references your router's exported client-list CSV (fetched live from a URL you provide - see [Known device names](#known-device-names-optional) below) to show real device names for Hue/Matter records, which carry no human-friendly name of their own in mDNS.
+- Shows progress and expected-device coverage for Chromecast.
 - Provides diagnostics for parsed mDNS sections and raw cached records.
-- Moves non-responsive device records to an achive table for 7 days, then permanntly deletes them.
+- Keeps a short "previously discovered" history (retained for a configurable number of days) for all three device types without polluting the current list.
 
 ## What it does not do
 
 - It does not create Hubitat child devices.
-- It does not control Chromecast devices.
+- It does not control Chromecast, Hue, or Matter devices.
 - It does not send media, TTS, play, pause, volume, or app-launch commands.
 - It does not parse raw UDP replies for the final device list.
 - It does not replace Hubitat's native Chromecast Integration.
+- It does not identify a Hue/Matter device by name unless mDNS provides one (Hue does; Matter does not) or you've configured the router client-list CSV URL.
 
 ## Discovery flow
 
 ```text
-Run Chromecast discovery
+Run mDNS discovery
   ↓
 Send short mDNS probe
   ↓
-Wait for Hubitat mDNS cache to update
+Fetch router client-list CSV (if configured)
   ↓
 Read /hub/mdnsDevices/json from the local hub
   ↓
-Parse Google Cast endpoints
+Parse Google Cast, Hue, and Matter endpoints
   ↓
-Display clean resolved devices
-```
-
-## Default scan timing
-
-The current version is tuned for a short scan of about 5 seconds.
-
-| Setting | Default |
-|---|---:|
-| Discovery page refresh interval | 1 second |
-| Pre-scan mDNS probe bursts | 2 |
-| Pause between pre-scan bursts | 500 ms |
-| Wait after pre-scan before reading cache | 1000 ms |
-| Expected Chromecast devices | 15 |
-
-Expected timing:
-
-```text
-0 sec - start
-1 sec - probe 1
-2 sec - probe 2
-3 sec - settle
-4 sec - read JSON
-5 sec - complete
+Display clean resolved devices per section
 ```
 
 ## Hub IP detection
@@ -73,10 +51,11 @@ location?.hub?.localIP
 location?.hub?.getDataValue("localIP")
 ```
 
-It then builds a single local endpoint URL:
+It then builds candidate endpoint URLs on both port 80 and 8080:
 
 ```groovy
 "http://${hubIp}:8080/hub/mdnsDevices/json"
+"http://${hubIp}/hub/mdnsDevices/json"
 ```
 
 There are no hardcoded IP addresses, no `localhost` fallback, no `127.0.0.1` fallback, and no manual URL override.
@@ -85,83 +64,37 @@ There are no hardcoded IP addresses, no `localhost` fallback, no `127.0.0.1` fal
 
 1. In Hubitat, go to **Apps Code**.
 2. Click **New App**.
-3. Paste the Groovy source code.
+3. Paste the Groovy source code from `Apps/mDNS_Device_Discovery.groovy`.
 4. Click **Save**.
 5. Go to **Apps**.
 6. Click **Add User App**.
-7. Select **Chromecast mDNS Discovery**.
+7. Select **mDNS Device Discovery**.
 8. Open the Discovery Page.
-9. Click **Run Chromecast discovery**.
+9. Click **Run mDNS discovery**.
 
 ## Configuration
 
-### Discovery page refresh interval
+### Discovery page refresh interval / probe settings
 
-Controls how often the Hubitat dynamic page refreshes while the scan is running.
+Standard mDNS pre-scan probe controls (bursts, timing) - see the app's own preference descriptions for current defaults.
 
-Recommended:
+### Known device names (optional)
 
-```text
-1 second
-```
+Matter's mDNS records carry no human-friendly name (Hue's does), so the app can optionally cross-reference a router-exported device list to show real names instead of raw mDNS IDs.
 
-### Expected number of Chromecast devices
+1. Export your router's client list as CSV (needs a header row with `Client Name` and `Clients MAC Address` columns, in any position/order).
+2. Upload it to Hubitat's own **File Manager** (Settings > File Manager) so it's hosted locally by the hub - this keeps everything on your LAN with no internet dependency and no data leaving your network.
+3. Paste the resulting local URL (e.g. `http://<hub-ip>:8080/local/ClientList.csv`) into the **Router client list CSV URL** setting.
 
-Used only for the device coverage progress bar.
+The file is re-fetched on every discovery run, so re-uploading an updated export keeps it current with no code changes needed. If unset, "Known As" falls back to matching a Matter/Hue device's MAC or IP against the currently-discovered Chromecast list (useful when e.g. an Android TV's Matter helper service shares its Cast device's identity).
 
-Example:
-
-```text
-15
-```
-
-Set to `0` to disable expected coverage tracking.
-
-### Stale record threshold
-
-Marks records as stale based on Hubitat's `lastUpdated` timestamp.
-
-Default:
-
-```text
-120 minutes
-```
-
-### Send mDNS probe before reading Hubitat cache
-
-Recommended:
-
-```text
-On
-```
-
-This sends a short multicast mDNS query before reading the internal cache. The app does not use the raw UDP replies as the source of truth. It only uses the probe to encourage Hubitat's cache to refresh.
-
-### Pre-scan mDNS probe bursts
-
-Default:
-
-```text
-2
-```
-
-Increase this only if devices are slow to appear in the Hubitat mDNS cache.
-
-### Wait after pre-scan before reading cache
-
-Default:
-
-```text
-1000 ms
-```
-
-Increase this if the cache appears to update slowly on your network.
+**Note:** don't commit a real router export to a public repo/fork - it's your home network's device inventory. This setting is stored in your own hub's app configuration, not in the app's source code.
 
 ## Output
 
-The app displays a clean table of resolved Google Cast devices.
+The app displays separate tables per service type.
 
-Typical fields:
+### Chromecast
 
 | Field | Meaning |
 |---|---|
@@ -171,10 +104,25 @@ Typical fields:
 | Model | Device model from mDNS TXT data |
 | Type | Inferred display, speaker, TV/streamer, or cast group |
 | Status | Receiver/app status where available |
-| Source | mDNS |
+| Source | mDNS JSON or HTML |
 | Last seen | Timestamp from Hubitat's mDNS cache |
 
-## Device types
+### Hue Bridge / Matter
+
+| Field | Meaning |
+|---|---|
+| Name | mDNS device/instance name (Hue: friendly name; Matter: fixed 33-char fabricId-nodeId, no friendly name exists in the protocol) |
+| Host | mDNS server hostname |
+| IP | IPv4 address |
+| Port | Service port |
+| MAC | Device MAC address |
+| Vendor | Manufacturer from a small verified MAC-OUI table, or a brand inferred from "Known As" when the MAC is randomized |
+| Known As | Cross-referenced human-friendly name - see [Known device names](#known-device-names-optional) |
+| Last seen | Timestamp from Hubitat's mDNS cache |
+
+Both current and "previously discovered" (faded, retained for a configurable number of days) tables share column widths within their section so headers stay aligned, and wrap in a horizontally-scrollable container so wide tables remain usable on mobile.
+
+## Device types (Chromecast)
 
 The app infers device type from name, model, host, and port.
 
@@ -191,33 +139,20 @@ Examples:
 
 The Diagnostics page shows:
 
-- Last discovery status.
-- Last error, if any.
-- Detected hub IP.
-- Dynamic mDNS source URL.
-- Last working source.
+- Last discovery status and last error, if any.
+- Detected hub IP and endpoint source order.
 - Parsed mDNS service sections.
-- Raw cached device map.
+- Raw cached device maps and history for all three device types (Chromecast, Hue, Matter).
 - Optional raw mDNS cache sample.
-
-Useful service sections include:
-
-```text
-_googlecast._tcp.local
-_hue._tcp.local
-_matter._tcp.local
-```
-
-Only `_googlecast._tcp.local` records are used for the clean Chromecast device list.
 
 ## Why this approach exists
 
-Hubitat's native mDNS registry can already see Google Cast devices reliably. Raw multicast discovery from a custom Groovy app can be inconsistent because responses may arrive split across PTR, SRV, TXT, and A records, and Hubitat's app runtime does not always expose those replies cleanly.
+Hubitat's native mDNS registry can already see these devices reliably. Raw multicast discovery from a custom Groovy app can be inconsistent because responses may arrive split across PTR, SRV, TXT, and A records, and Hubitat's app runtime does not always expose those replies cleanly.
 
 This app uses a hybrid approach:
 
-- mDNS probe for stimulation.
-- Hubitat internal JSON cache for reliable device data.
+- mDNS probe for stimulation (Chromecast only).
+- Hubitat's internal JSON cache for reliable device data across all three service types.
 - Discovery-style UI for usability.
 
 That avoids the unreliable part of raw mDNS parsing while keeping the user experience of a normal discovery scan.
@@ -225,10 +160,11 @@ That avoids the unreliable part of raw mDNS parsing while keeping the user exper
 ## Known limitations
 
 - The internal Hubitat mDNS endpoint is not an officially documented public API.
-- The app depends on Hubitat exposing `/hub/mdnsDevices/json` locally on port `8080`.
 - If Hubitat changes the internal JSON structure, the parser may need updating.
-- This app is discovery-only. It does not provide Chromecast control.
+- This app is discovery-only. It does not provide device control.
 - Device presence depends on what Hubitat currently has in its mDNS cache.
+- Matter device names are protocol-fixed IDs, not friendly names - use the router client-list CSV if you want real names.
+- The Vendor MAC-OUI table only covers prefixes the author has personally verified, not a general-purpose OUI database.
 
 ## Troubleshooting
 
@@ -240,7 +176,7 @@ Confirm the app is using the dynamic port `8080` endpoint:
 http://<hub-ip>:8080/hub/mdnsDevices/json
 ```
 
-Port `80` may fail from the Hubitat app runtime even when the browser UI works.
+Port `80` may fail from the Hubitat app runtime even when the browser UI works. The app tries both.
 
 ### No devices found
 
@@ -249,41 +185,41 @@ Check:
 - The hub can see devices under Hubitat's native mDNS devices page.
 - The devices are on the same network/VLAN as the hub.
 - Multicast/mDNS is not blocked by Wi-Fi isolation, VLAN rules, or firewall rules.
-- The expected service section `_googlecast._tcp.local` exists in diagnostics.
+- The expected service section (`_googlecast._tcp.local`, `_hue._tcp.local`, or `_matter._tcp.local`) exists in diagnostics.
 
-### Progress bar does not move
+### "Known As" isn't populated
 
-The app uses page-driven progress. Ensure the Discovery Page refresh interval is set to:
-
-```text
-1 second
-```
-
-### Device coverage is below expected count
-
-The expected count is only a display target. If you expect 15 devices but Hubitat currently sees 14, the scan can still be working correctly. Check diagnostics to see what Hubitat's mDNS cache currently contains.
+Confirm the **Router client list CSV URL** setting points to an actual URL the hub can fetch (not a file path on your computer - the hub cannot read your PC's filesystem), and that the CSV has `Client Name` and `Clients MAC Address` columns in its header row.
 
 ## Version history
 
-### v1.0.1
+### v1.5.4
 
-- Tuned to complete in approximately 5 seconds.
-- Uses 1 second page refresh.
-- Uses 2 mDNS probe bursts.
-- Uses 1000 ms cache settle wait.
-- Keeps dynamic hub IP detection.
-- Uses port `8080` for the internal mDNS JSON endpoint.
-- Discovery-only. No child devices and no control commands.
+- Added a horizontal-scroll wrapper to both device tables so wide tables remain usable on mobile.
 
-### v1.0.0
+### v1.5.0 - v1.5.3
 
-- Initial cleaned GitHub version.
-- Hybrid mDNS probe plus Hubitat JSON cache lookup.
-- Discovery-style UI with progress and coverage.
+- Added optional router client-list CSV cross-referencing (fetched live from a configurable URL, not baked into source) to resolve real device names for Hue/Matter records.
+- Fixed a Hubitat app-sandbox restriction on direct `java.io.*` class references in the CSV-fetch response handling.
+
+### v1.4.x
+
+- Added MAC-OUI based Vendor lookup, with a brand-from-name fallback for randomized MACs.
+- Added a "Known As" cross-reference against the currently-discovered Chromecast list.
+
+### v1.3.0
+
+- Renamed from "Chromecast mDNS Discovery" to "mDNS Device Discovery".
+- Added Hue Bridge and Matter device discovery alongside Chromecast, with full current/history parity across all three types.
+- Fixed column-width alignment issues (Matter's fixed 33-character names needed more buffer than Chromecast's shorter friendly names allowed for).
+
+### v1.2.0 and earlier
+
+See prior releases for the original Chromecast-only discovery implementation.
 
 ## Safety and scope
 
-This app is local-network discovery tooling only. It does not authenticate to Google, does not call cloud APIs, does not create devices, and does not send commands to Chromecast devices.
+This app is local-network discovery tooling only. It does not authenticate to Google, does not call cloud APIs by default, does not create devices, and does not send commands to any discovered device. The optional router client-list CSV fetch only talks to a URL you configure yourself (recommended: your own hub's local File Manager).
 
 ## License
 

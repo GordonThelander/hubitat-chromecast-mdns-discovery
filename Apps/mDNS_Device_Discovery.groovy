@@ -1,36 +1,40 @@
 /**
- *  Chromecast mDNS Discovery
+ *  mDNS Device Discovery
  *
- *  Version: 1.2.0
+ *  Version: 1.5.4
  *  Author: Gordon Thelander
  *  Platform: Hubitat Elevation
  *
  *  Purpose:
- *  Discovery-style Hubitat app for Google Cast / Chromecast devices.
- *  
+ *  Discovery-style Hubitat app for Google Cast / Chromecast, Philips Hue Bridge,
+ *  and Matter devices visible in Hubitat's own mDNS cache.
+ *
  *  Design goals:
  *  - Dynamically detect the Hubitat hub IP address.
- *  - Fires off mDNS multicast discovery probe packet pulses to 224.0.0.251:5353 to wake dormant devices 
+ *  - Fires off mDNS multicast discovery probe packet pulses to 224.0.0.251:5353 to wake dormant devices
  *  - Read Hubitat's own mDNS cache from /hub/mdnsDevices and /hub/mdnsDevices/json.
  *  - Prefer JSON when available, but fall back to parsing the HTML table shown by Hubitat.
- *  - Display only clean Google Cast / Chromecast records with friendly name, IP:port as well as current Receiver Status
+ *  - Display clean Google Cast / Chromecast records with friendly name, IP:port and current Receiver Status,
+ *    plus Hue Bridge and Matter records with friendly name/host, IP:port and MAC address.
  *  - Keep a short history of previously discovered devices without polluting the current list.
- *  - Does not create child devices and does not control Chromecast devices.
+ *  - Does not create child devices and does not control any discovered devices.
  */
 
 import groovy.json.JsonSlurper
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = '1.2.0'
+@Field static final String APP_VERSION = '1.5.4'
 @Field static final String GOOGLECAST_SERVICE = '_googlecast._tcp.local'
 @Field static final String GOOGLEZONE_SERVICE = '_googlezone._tcp.local'
 @Field static final String SERVICES_SERVICE = '_services._dns-sd._udp.local'
+@Field static final String HUE_SERVICE = '_hue._tcp.local'
+@Field static final String MATTER_SERVICE = '_matter._tcp.local'
 
 definition(
-    name: 'Chromecast mDNS Discovery',
+    name: 'mDNS Device Discovery',
     namespace: 'gordon-thelander',
     author: 'Gordon Thelander',
-    description: 'Discovery-only Google Cast / Chromecast inventory using Hubitat mDNS cache. No child devices are created.',
+    description: 'Discovery-only inventory of Google Cast / Chromecast, Hue Bridge, and Matter mDNS records using Hubitat mDNS cache. No child devices are created.',
     category: 'Convenience',
     iconUrl: '',
     iconX2Url: '',
@@ -58,6 +62,11 @@ def updated() {
 def initialise() {
     state.currentDevices = state.currentDevices instanceof Map ? state.currentDevices : [:]
     state.deviceHistory = state.deviceHistory instanceof Map ? state.deviceHistory : [:]
+    state.currentHueDevices = state.currentHueDevices instanceof Map ? state.currentHueDevices : [:]
+    state.hueDeviceHistory = state.hueDeviceHistory instanceof Map ? state.hueDeviceHistory : [:]
+    state.currentMatterDevices = state.currentMatterDevices instanceof Map ? state.currentMatterDevices : [:]
+    state.matterDeviceHistory = state.matterDeviceHistory instanceof Map ? state.matterDeviceHistory : [:]
+    state.routerDeviceNames = state.routerDeviceNames instanceof Map ? state.routerDeviceNames : [:]
     state.mdnsSections = state.mdnsSections instanceof List ? state.mdnsSections : []
     state.rawSample = state.rawSample ?: null
     state.lastRunAt = state.lastRunAt ?: null
@@ -83,9 +92,9 @@ def disableDebugLogging() {
 }
 
 def mainPage() {
-    return dynamicPage(name: 'mainPage', title: 'Chromecast mDNS Discovery', install: true, uninstall: true) {
+    return dynamicPage(name: 'mainPage', title: 'mDNS Device Discovery', install: true, uninstall: true) {
         section('Purpose') {
-            paragraph "<b>Version:</b> ${APP_VERSION}<br><b>Mode:</b> Discovery only. This app reads Hubitat's mDNS cache and lists Google Cast / Chromecast records. It does not create devices."
+            paragraph "<b>Version:</b> ${APP_VERSION}<br><b>Mode:</b> Discovery only. This app reads Hubitat's mDNS cache and lists Google Cast / Chromecast, Hue Bridge, and Matter records. It does not create devices."
         }
 
         section('Configuration') {
@@ -103,8 +112,12 @@ def mainPage() {
             input name: 'wakeDelayMs', type: 'number', title: 'Reserved - no blocking wait used by this version', defaultValue: 0, required: true, submitOnChange: true
         }
 
+        section('Known device names (optional)') {
+            input name: 'routerClientListUrl', type: 'text', title: 'Router client list CSV URL', description: 'Optional. A URL the hub itself can fetch (re-fetched on every discovery run), returning your router\'s exported device list CSV with a header row containing "Client Name" and "Clients MAC Address" columns (any position/order). Recommended: upload the CSV to Hubitat\'s own File Manager (gear icon > File Manager) and use its local URL, e.g. http://<hub-ip>/local/ClientList.csv - keeps this fully local with no internet dependency. Used to show real device names for Hue/Matter records instead of raw mDNS IDs.', required: false, submitOnChange: true
+        }
+
         section('Controls') {
-            input name: 'runDiscoveryBtn', type: 'button', title: 'Run Chromecast discovery', submitOnChange: true
+            input name: 'runDiscoveryBtn', type: 'button', title: 'Run mDNS discovery', submitOnChange: true
             input name: 'clearCurrentBtn', type: 'button', title: 'Clear current results', submitOnChange: true
             input name: 'clearAllBtn', type: 'button', title: 'Clear all results and history', submitOnChange: true
         }
@@ -117,6 +130,14 @@ def mainPage() {
             paragraph buildDeviceTableHtml()
         }
 
+        section('Hue Bridges (mDNS)') {
+            paragraph buildHueTableHtml()
+        }
+
+        section('Matter Devices (mDNS)') {
+            paragraph buildMatterTableHtml()
+        }
+
         section('Diagnostics') {
             input name: 'storeRawSample', type: 'bool', title: 'Store raw endpoint sample?', defaultValue: true, required: true, submitOnChange: true
             input name: 'showRawSections', type: 'bool', title: 'Show mDNS service section summary?', defaultValue: false, required: true, submitOnChange: true
@@ -127,7 +148,7 @@ def mainPage() {
 }
 
 def diagnosticsPage() {
-    return dynamicPage(name: 'diagnosticsPage', title: 'Chromecast mDNS Discovery Diagnostics', install: false, uninstall: false) {
+    return dynamicPage(name: 'diagnosticsPage', title: 'mDNS Device Discovery Diagnostics', install: false, uninstall: false) {
         section('Source') {
             paragraph buildSourceHtml()
         }
@@ -149,6 +170,22 @@ def diagnosticsPage() {
 
         section('Previously discovered devices') {
             paragraph "<pre style='white-space:pre-wrap;font-size:11px;'>${htmlEncode(prettyValue(state.deviceHistory ?: [:]))}</pre>"
+        }
+
+        section('Current parsed Hue bridges') {
+            paragraph "<pre style='white-space:pre-wrap;font-size:11px;'>${htmlEncode(prettyValue(state.currentHueDevices ?: [:]))}</pre>"
+        }
+
+        section('Hue bridge history') {
+            paragraph "<pre style='white-space:pre-wrap;font-size:11px;'>${htmlEncode(prettyValue(state.hueDeviceHistory ?: [:]))}</pre>"
+        }
+
+        section('Current parsed Matter devices') {
+            paragraph "<pre style='white-space:pre-wrap;font-size:11px;'>${htmlEncode(prettyValue(state.currentMatterDevices ?: [:]))}</pre>"
+        }
+
+        section('Matter device history') {
+            paragraph "<pre style='white-space:pre-wrap;font-size:11px;'>${htmlEncode(prettyValue(state.matterDeviceHistory ?: [:]))}</pre>"
         }
 
         if (state.rawSample) {
@@ -197,6 +234,8 @@ def runDiscoveryNow() {
             sendMdnsProbes()
         }
 
+        fetchRouterClientNames()
+
         // Hubitat app code is unreliable when a button press depends on a later runIn()
         // while the dynamic preference page is open. Read immediately so the button action
         // completes in the same execution context and the page updates deterministically.
@@ -217,23 +256,37 @@ def completeDiscoveryRead() {
         if (result.ok == true) {
             Map previousCurrent = state.currentDevices instanceof Map ? state.currentDevices : [:]
             Map newCurrent = result.devices instanceof Map ? result.devices : [:]
+            Map previousHueCurrent = state.currentHueDevices instanceof Map ? state.currentHueDevices : [:]
+            Map newHueCurrent = result.hueDevices instanceof Map ? result.hueDevices : [:]
+            Map previousMatterCurrent = state.currentMatterDevices instanceof Map ? state.currentMatterDevices : [:]
+            Map newMatterCurrent = result.matterDevices instanceof Map ? result.matterDevices : [:]
 
             state.currentDevices = newCurrent
+            state.currentHueDevices = newHueCurrent
+            state.currentMatterDevices = newMatterCurrent
             state.mdnsSections = result.sections instanceof List ? result.sections : []
             state.lastWorkingUrl = result.url ?: state.lastWorkingUrl
             state.lastSuccessAt = formatNow()
             state.rawSample = storeRawSample == false ? null : trimForStorage(result.rawText?.toString(), 120000)
 
-            mergeIntoHistory(previousCurrent)
-            mergeIntoHistory(newCurrent)
+            state.deviceHistory = mergeIntoHistoryGeneric(state.deviceHistory, previousCurrent) { Map i -> isCleanDevice(i) }
+            state.deviceHistory = mergeIntoHistoryGeneric(state.deviceHistory, newCurrent) { Map i -> isCleanDevice(i) }
+            state.hueDeviceHistory = mergeIntoHistoryGeneric(state.hueDeviceHistory, previousHueCurrent) { Map i -> isCleanSimpleDevice(i) }
+            state.hueDeviceHistory = mergeIntoHistoryGeneric(state.hueDeviceHistory, newHueCurrent) { Map i -> isCleanSimpleDevice(i) }
+            state.matterDeviceHistory = mergeIntoHistoryGeneric(state.matterDeviceHistory, previousMatterCurrent) { Map i -> isCleanSimpleDevice(i) }
+            state.matterDeviceHistory = mergeIntoHistoryGeneric(state.matterDeviceHistory, newMatterCurrent) { Map i -> isCleanSimpleDevice(i) }
             pruneHistory()
 
             Integer clean = newCurrent.size()
+            Integer hueCount = newHueCurrent.size()
+            Integer matterCount = newMatterCurrent.size()
             Integer sections = state.mdnsSections?.size() ?: 0
-            state.lastMessage = "Discovery completed. Clean Chromecast records: ${clean}. mDNS service sections parsed: ${sections}. Source: ${state.lastWorkingUrl ?: 'unknown'}."
+            state.lastMessage = "Discovery completed. Clean Chromecast records: ${clean}. Hue bridges: ${hueCount}. Matter devices: ${matterCount}. mDNS service sections parsed: ${sections}. Source: ${state.lastWorkingUrl ?: 'unknown'}."
             log.info state.lastMessage
         } else {
             state.currentDevices = [:]
+            state.currentHueDevices = [:]
+            state.currentMatterDevices = [:]
             state.mdnsSections = result.sections instanceof List ? result.sections : []
             state.rawSample = result.rawText ? trimForStorage(result.rawText?.toString(), 120000) : null
             state.lastError = result.error ?: 'Unknown discovery failure.'
@@ -242,6 +295,8 @@ def completeDiscoveryRead() {
         }
     } catch (Exception e) {
         state.currentDevices = [:]
+        state.currentHueDevices = [:]
+        state.currentMatterDevices = [:]
         state.lastError = "Unexpected discovery read error: ${e.message}"
         state.lastMessage = "Discovery failed. ${state.lastError}"
         log.warn state.lastMessage
@@ -323,12 +378,14 @@ Map fetchMdnsCache() {
         error: failures ? failures.join(' | ') : 'No mDNS endpoint candidates available.',
         rawText: null,
         devices: [:],
+        hueDevices: [:],
+        matterDevices: [:],
         sections: []
     ]
 }
 
 Map fetchAndParseEndpoint(String url) {
-    Map out = [ok: false, url: url, error: null, rawText: null, devices: [:], sections: []]
+    Map out = [ok: false, url: url, error: null, rawText: null, devices: [:], hueDevices: [:], matterDevices: [:], sections: []]
 
     try {
         Map params = [
@@ -356,9 +413,11 @@ Map fetchAndParseEndpoint(String url) {
             }
 
             out.devices = parsed.devices instanceof Map ? parsed.devices : [:]
+            out.hueDevices = parsed.hueDevices instanceof Map ? parsed.hueDevices : [:]
+            out.matterDevices = parsed.matterDevices instanceof Map ? parsed.matterDevices : [:]
             out.sections = parsed.sections instanceof List ? parsed.sections : []
 
-            if (!out.devices && !out.sections) {
+            if (!out.devices && !out.hueDevices && !out.matterDevices && !out.sections) {
                 out.error = 'Endpoint was reachable but no mDNS records were parsed.'
                 return
             }
@@ -382,7 +441,7 @@ Map parseMdnsPossiblyJson(Object data, String raw) {
 
     if (data instanceof String) {
         String s = raw?.trim() ?: ''
-        if (!s) return [devices: [:], sections: []]
+        if (!s) return [devices: [:], hueDevices: [:], matterDevices: [:], sections: []]
         json = new JsonSlurper().parseText(s)
     }
 
@@ -391,47 +450,49 @@ Map parseMdnsPossiblyJson(Object data, String raw) {
 
 Map parseMdnsJsonFlexible(Object json) {
     Map devices = [:]
+    Map hueDevices = [:]
+    Map matterDevices = [:]
     List sections = []
 
-    if (!json) return [devices: devices, sections: sections]
+    if (!json) return [devices: devices, hueDevices: hueDevices, matterDevices: matterDevices, sections: sections]
 
     if (json instanceof Map) {
         Map root = json as Map
 
         if (root.serviceTypes instanceof List) {
-            parseServiceTypeList(root.serviceTypes as List, devices, sections)
-            return [devices: devices, sections: sections]
+            parseServiceTypeList(root.serviceTypes as List, devices, hueDevices, matterDevices, sections)
+            return [devices: devices, hueDevices: hueDevices, matterDevices: matterDevices, sections: sections]
         }
 
         if (root.services instanceof List) {
-            parseServiceTypeList(root.services as List, devices, sections)
-            return [devices: devices, sections: sections]
+            parseServiceTypeList(root.services as List, devices, hueDevices, matterDevices, sections)
+            return [devices: devices, hueDevices: hueDevices, matterDevices: matterDevices, sections: sections]
         }
 
         root.each { k, v ->
             String serviceType = cleanupService(k?.toString())
             List endpoints = extractEndpointList(v)
-            parseEndpointListForService(serviceType, endpoints, devices, sections)
+            parseEndpointListForService(serviceType, endpoints, devices, hueDevices, matterDevices, sections)
         }
 
-        return [devices: devices, sections: sections]
+        return [devices: devices, hueDevices: hueDevices, matterDevices: matterDevices, sections: sections]
     }
 
     if (json instanceof List) {
         List records = json as List
-        parseEndpointListForService(GOOGLECAST_SERVICE, records, devices, sections)
+        parseEndpointListForService(GOOGLECAST_SERVICE, records, devices, hueDevices, matterDevices, sections)
     }
 
-    return [devices: devices, sections: sections]
+    return [devices: devices, hueDevices: hueDevices, matterDevices: matterDevices, sections: sections]
 }
 
-void parseServiceTypeList(List serviceTypes, Map devices, List sections) {
+void parseServiceTypeList(List serviceTypes, Map devices, Map hueDevices, Map matterDevices, List sections) {
     serviceTypes.each { svcObj ->
         if (!(svcObj instanceof Map)) return
         Map svc = svcObj as Map
         String serviceType = cleanupService(stringFirst(svc.serviceType, svc.type, svc.name, svc.service, ''))
         List endpoints = extractEndpointList(svc.endpoints ?: svc.devices ?: svc.records ?: svc.instances)
-        parseEndpointListForService(serviceType, endpoints, devices, sections, safeNullableInt(svc.count))
+        parseEndpointListForService(serviceType, endpoints, devices, hueDevices, matterDevices, sections, safeNullableInt(svc.count))
     }
 }
 
@@ -448,20 +509,33 @@ List extractEndpointList(Object obj) {
     return []
 }
 
-void parseEndpointListForService(String serviceType, List endpoints, Map devices, List sections, Integer declaredCount = null) {
+void parseEndpointListForService(String serviceType, List endpoints, Map devices, Map hueDevices, Map matterDevices, List sections, Integer declaredCount = null) {
     String svc = cleanupService(serviceType)
     Integer parsedCount = 0
     Integer cleanCastCount = 0
 
     endpoints.each { epObj ->
         if (!(epObj instanceof Map)) return
+        Map raw = epObj as Map
 
-        Map item = normaliseEndpoint(epObj as Map, svc)
-        if (item.name || item.ip || item.host) parsedCount++
-
-        if (isGoogleCastService(svc, item) && isCleanDevice(item)) {
-            addOrMergeDevice(devices, item)
-            cleanCastCount++
+        if (isGoogleCastService(svc)) {
+            Map item = normaliseEndpoint(raw, svc)
+            if (item.name || item.ip || item.host) parsedCount++
+            if (isCleanDevice(item)) {
+                addOrMergeDevice(devices, item)
+                cleanCastCount++
+            }
+        } else if (isHueService(svc)) {
+            Map item = normaliseSimpleEndpoint(raw, svc, 'Hue Bridge', 'Hue Bridge')
+            if (item.name || item.ip || item.host) parsedCount++
+            if (isCleanSimpleDevice(item)) addOrMergeSimpleDevice(hueDevices, item, 'hue')
+        } else if (isMatterService(svc)) {
+            Map item = normaliseSimpleEndpoint(raw, svc, 'Matter Device', 'Matter Device')
+            if (item.name || item.ip || item.host) parsedCount++
+            if (isCleanSimpleDevice(item)) addOrMergeSimpleDevice(matterDevices, item, 'matter')
+        } else {
+            Map item = normaliseSimpleEndpoint(raw, svc, '', '')
+            if (item.name || item.ip || item.host) parsedCount++
         }
     }
 
@@ -590,7 +664,10 @@ Map parseMdnsHtml(String html) {
         sections << [serviceType: currentService ?: 'html', declaredCount: null, parsedCount: devices.size(), cleanGoogleCastCount: devices.size()]
     }
 
-    return [devices: devices, sections: sections]
+    // The HTML page only ever carried a Chromecast table historically, and on current
+    // Hubitat firmware (2.5.0.159+) it's an empty client-rendered Vue shell with no
+    // server-side table at all, so Hue/Matter extraction isn't attempted here.
+    return [devices: devices, hueDevices: [:], matterDevices: [:], sections: sections]
 }
 
 void parseHtmlByLines(String html, String serviceType, Map devices, Map sectionStats) {
@@ -681,13 +758,23 @@ Map ensureSectionStats(Map sectionStats, String serviceType) {
     return sectionStats[svc] as Map
 }
 
-Boolean isGoogleCastService(String serviceType, Map item = null) {
+Boolean isGoogleCastService(String serviceType) {
     // Deliberately strict.
     // Hubitat /hub/mdnsDevices also returns _hue._tcp.local and _matter._tcp.local.
     // Those rows can have generic/default model text and must not be promoted into the
     // Chromecast inventory just because the fallback model contains the word 'Cast'.
     String svc = cleanupService(serviceType)?.toLowerCase() ?: ''
     return svc == GOOGLECAST_SERVICE || svc == "${GOOGLECAST_SERVICE}." || svc.contains('_googlecast._tcp.local')
+}
+
+Boolean isHueService(String serviceType) {
+    String svc = cleanupService(serviceType)?.toLowerCase() ?: ''
+    return svc == HUE_SERVICE || svc == "${HUE_SERVICE}." || svc.contains('_hue._tcp.local')
+}
+
+Boolean isMatterService(String serviceType) {
+    String svc = cleanupService(serviceType)?.toLowerCase() ?: ''
+    return svc == MATTER_SERVICE || svc == "${MATTER_SERVICE}." || svc.contains('_matter._tcp.local')
 }
 
 Boolean isCleanDevice(Map item) {
@@ -782,6 +869,66 @@ Integer deviceDisplayScore(Map item) {
     return score
 }
 
+Map normaliseSimpleEndpoint(Map m, String serviceType, String model, String type) {
+    String host = cleanupHost(stringFirst(m.server, m.host, m.hostname, m.target, m.domainName))
+    String ip = stringFirst(m.ip4Address, m.ipv4Address, m.ipAddress, m.address, m.ip, m.hostAddress)
+    String port = stringFirst(m.port, m.servicePort)
+    String rawName = stringFirst(m.name, m.eventName, m.instanceName, m.instance)
+    String lastUpdated = stringFirst(m.lastUpdated, m.updated, m.lastSeen)
+
+    return [
+        key: '',
+        name: cleanupName(rawName),
+        ip: cleanupIp(ip),
+        port: port ?: '',
+        model: model,
+        type: type,
+        host: host,
+        macAddress: stringFirst(m.macAddress, m.mac, ''),
+        serviceType: cleanupService(serviceType),
+        source: 'mDNS JSON',
+        lastUpdated: lastUpdated ?: '',
+        lastSeen: lastUpdated ?: formatNow(),
+        discoveredAt: formatNow(),
+        lastActiveAt: formatNow(),
+        lastActiveMs: nowMs()
+    ]
+}
+
+Boolean isCleanSimpleDevice(Map item) {
+    if (!item) return false
+    if (!item.name) return false
+    if (!item.ip || !isValidSimpleIp(item.ip.toString())) return false
+    if (!item.port) return false
+    return true
+}
+
+String simpleDeviceKey(Map item, String prefix) {
+    String ep = endpointKey(item)
+    if (ep) return "${prefix}-${sanitizeKey(ep)}"
+
+    String basis = "${item?.name ?: prefix}-${item?.host ?: 'host'}"
+    return "${prefix}-${sanitizeKey(basis)}"
+}
+
+void addOrMergeSimpleDevice(Map devicesMap, Map item, String prefix) {
+    if (!isCleanSimpleDevice(item)) return
+
+    String key = simpleDeviceKey(item, prefix)
+    Map candidate = item + [key: key]
+    Map existing = devicesMap[key] instanceof Map ? devicesMap[key] as Map : null
+
+    if (!existing) {
+        devicesMap[key] = candidate
+        return
+    }
+
+    Map merged = candidate + existing
+    merged.lastSeen = latestTimestamp(existing.lastSeen, candidate.lastSeen)
+    merged.lastUpdated = latestTimestamp(existing.lastUpdated, candidate.lastUpdated)
+    devicesMap[key] = merged
+}
+
 String latestTimestamp(Object a, Object b) {
     String sa = a?.toString() ?: ''
     String sb = b?.toString() ?: ''
@@ -792,17 +939,17 @@ String latestTimestamp(Object a, Object b) {
     return sa ?: sb
 }
 
-void mergeIntoHistory(Map devices) {
-    Map history = state.deviceHistory instanceof Map ? state.deviceHistory : [:]
+Map mergeIntoHistoryGeneric(Map history, Map devices, Closure isCleanFn) {
+    Map h = history instanceof Map ? history : [:]
 
     (devices ?: [:]).each { key, item ->
         if (!(item instanceof Map)) return
-        if (!isCleanDevice(item as Map)) return
+        if (!isCleanFn(item as Map)) return
 
-        Map existing = history[key] instanceof Map ? history[key] as Map : [:]
+        Map existing = h[key] instanceof Map ? h[key] as Map : [:]
         Long now = nowMs()
 
-        history[key] = existing + item + [
+        h[key] = existing + item + [
             key: key,
             firstDiscoveredAt: existing.firstDiscoveredAt ?: item.discoveredAt ?: formatNow(),
             lastActiveAt: formatNow(),
@@ -810,40 +957,44 @@ void mergeIntoHistory(Map devices) {
         ]
     }
 
-    state.deviceHistory = history
+    return h
 }
 
-void pruneHistory() {
-    Map history = state.deviceHistory instanceof Map ? state.deviceHistory : [:]
+Map pruneHistoryGeneric(Map history) {
+    Map h = history instanceof Map ? history : [:]
     Integer days = clampInt(safeInt(previousRetentionDays ?: 7), 1, 365)
     Long cutoff = nowMs() - (days * 24L * 60L * 60L * 1000L)
     Map retained = [:]
 
-    history.each { key, item ->
+    h.each { key, item ->
         Long lastMs = safeLong(item?.lastActiveMs)
         if (lastMs <= 0L) lastMs = nowMs()
         if (lastMs >= cutoff) retained[key] = item
     }
 
-    state.deviceHistory = retained
+    return retained
 }
 
-Map getPreviouslyDiscovered() {
-    pruneHistory()
-    Map current = state.currentDevices instanceof Map ? state.currentDevices : [:]
-    Map history = state.deviceHistory instanceof Map ? state.deviceHistory : [:]
+void pruneHistory() {
+    state.deviceHistory = pruneHistoryGeneric(state.deviceHistory)
+    state.hueDeviceHistory = pruneHistoryGeneric(state.hueDeviceHistory)
+    state.matterDeviceHistory = pruneHistoryGeneric(state.matterDeviceHistory)
+}
+
+Map getPreviouslyDiscoveredGeneric(Map current, Map history) {
+    Map cur = current instanceof Map ? current : [:]
+    Map hist = history instanceof Map ? history : [:]
     Map previous = [:]
     List currentEndpoints = []
 
-    current.each { key, item ->
+    cur.each { key, item ->
         String ep = endpointKey(item as Map)
         if (ep) currentEndpoints << ep
     }
 
-    history.each { key, item ->
+    hist.each { key, item ->
         if (!(item instanceof Map)) return
-        if (!isCleanDevice(item as Map)) return
-        if (current.containsKey(key)) return
+        if (cur.containsKey(key)) return
 
         String ep = endpointKey(item as Map)
         if (ep && currentEndpoints.contains(ep)) return
@@ -854,8 +1005,25 @@ Map getPreviouslyDiscovered() {
     return previous
 }
 
+Map getPreviouslyDiscovered() {
+    pruneHistory()
+    return getPreviouslyDiscoveredGeneric(state.currentDevices, state.deviceHistory)
+}
+
+Map getPreviouslyDiscoveredHue() {
+    pruneHistory()
+    return getPreviouslyDiscoveredGeneric(state.currentHueDevices, state.hueDeviceHistory)
+}
+
+Map getPreviouslyDiscoveredMatter() {
+    pruneHistory()
+    return getPreviouslyDiscoveredGeneric(state.currentMatterDevices, state.matterDeviceHistory)
+}
+
 void clearCurrentResults() {
     state.currentDevices = [:]
+    state.currentHueDevices = [:]
+    state.currentMatterDevices = [:]
     state.mdnsSections = []
     state.rawSample = null
     state.lastMessage = 'Current discovery results cleared. History retained.'
@@ -866,6 +1034,11 @@ void clearCurrentResults() {
 void clearAllResults() {
     state.currentDevices = [:]
     state.deviceHistory = [:]
+    state.currentHueDevices = [:]
+    state.hueDeviceHistory = [:]
+    state.currentMatterDevices = [:]
+    state.matterDeviceHistory = [:]
+    state.routerDeviceNames = [:]
     state.mdnsSections = []
     state.rawSample = null
     state.lastRunAt = null
@@ -925,12 +1098,20 @@ String getHubIpAddress() {
 String buildStatusHtml() {
     Map current = state.currentDevices instanceof Map ? state.currentDevices : [:]
     Map previous = getPreviouslyDiscovered()
+    Map hueCurrent = state.currentHueDevices instanceof Map ? state.currentHueDevices : [:]
+    Map huePrevious = getPreviouslyDiscoveredHue()
+    Map matterCurrent = state.currentMatterDevices instanceof Map ? state.currentMatterDevices : [:]
+    Map matterPrevious = getPreviouslyDiscoveredMatter()
     StringBuilder b = new StringBuilder()
     b << "<div style='font-size:13px;'>"
     b << "<table style='font-size:13px;border-collapse:collapse;'>"
     b << "<tr><td style='font-weight:bold;padding-right:18px;'>Detected hub IP</td><td>${htmlEncode(state.lastHubIp ?: getHubIpAddress() ?: 'unknown')}</td></tr>"
-    b << "<tr><td style='font-weight:bold;padding-right:18px;'>Current clean records</td><td>${current.size()}</td></tr>"
-    b << "<tr><td style='font-weight:bold;padding-right:18px;'>Previously discovered</td><td>${previous.size()}</td></tr>"
+    b << "<tr><td style='font-weight:bold;padding-right:18px;'>Current clean Chromecast records</td><td>${current.size()}</td></tr>"
+    b << "<tr><td style='font-weight:bold;padding-right:18px;'>Previously discovered Chromecast</td><td>${previous.size()}</td></tr>"
+    b << "<tr><td style='font-weight:bold;padding-right:18px;'>Current Hue bridges</td><td>${hueCurrent.size()}</td></tr>"
+    b << "<tr><td style='font-weight:bold;padding-right:18px;'>Previously discovered Hue bridges</td><td>${huePrevious.size()}</td></tr>"
+    b << "<tr><td style='font-weight:bold;padding-right:18px;'>Current Matter devices</td><td>${matterCurrent.size()}</td></tr>"
+    b << "<tr><td style='font-weight:bold;padding-right:18px;'>Previously discovered Matter devices</td><td>${matterPrevious.size()}</td></tr>"
     b << "<tr><td style='font-weight:bold;padding-right:18px;'>mDNS sections parsed</td><td>${state.mdnsSections?.size() ?: 0}</td></tr>"
     b << "<tr><td style='font-weight:bold;padding-right:18px;'>Last successful source</td><td style='font-family:monospace;'>${htmlEncode(state.lastWorkingUrl ?: 'none yet')}</td></tr>"
     b << "<tr><td style='font-weight:bold;padding-right:18px;'>Last run</td><td>${htmlEncode(state.lastRunAt ?: 'not yet')}</td></tr>"
@@ -998,7 +1179,7 @@ List<Integer> getDeviceTableColumnWidths(Map current, Map previous) {
 
         values.eachWithIndex { value, Integer idx ->
             Integer len = value?.toString()?.length() ?: 0
-            widths[idx] = Math.max(widths[idx], Math.min(len + 2, getMaxColumnWidth(idx)))
+            widths[idx] = Math.max(widths[idx], Math.min(len + 4, getMaxColumnWidth(idx)))
         }
     }
 
@@ -1027,9 +1208,13 @@ String buildTable(Map devices, Boolean faded, List<Integer> widths) {
     String colour = faded ? 'color:#888888;' : ''
     StringBuilder b = new StringBuilder()
 
+    // Mobile WebViews (including Hubitat's own app) generally only recognise vertical
+    // page-level swipes, so a wide fixed-layout table needs its own explicit horizontal
+    // scroll container or its overflow becomes completely unreachable on a phone.
+    b << "<div style='overflow-x:auto;-webkit-overflow-scrolling:touch;width:100%;'>"
     b << "<table style='font-size:13px;border-collapse:collapse;table-layout:fixed;width:auto;white-space:nowrap;${colour}'>"
     b << buildColgroupHtml(widths)
-    b << "<tr style='${colour}'><th align='left'>Name</th><th align='left'>IP</th><th align='left'>Port</th><th align='left'>Model</th><th align='left'>Type</th><th align='left'>Status</th><th align='left'>Source</th><th align='left'>Last seen</th></tr>" 
+    b << "<tr style='${colour}'><th align='left'>Name</th><th align='left'>IP</th><th align='left'>Port</th><th align='left'>Model</th><th align='left'>Type</th><th align='left'>Status</th><th align='left'>Source</th><th align='left'>Last seen</th></tr>"
 
     devices.sort { a, c -> compareIpAddress(a.value.ip?.toString(), c.value.ip?.toString()) ?: (a.value.name <=> c.value.name) }.each { key, item ->
         b << '<tr>'
@@ -1045,6 +1230,7 @@ String buildTable(Map devices, Boolean faded, List<Integer> widths) {
     }
 
     b << '</table>'
+    b << '</div>'
     return b.toString()
 }
 
@@ -1060,6 +1246,288 @@ String displayStatus(Map item) {
 
 String deviceCell(Object value) {
     return "<td style='padding-right:18px;overflow:hidden;text-overflow:ellipsis;'>${htmlEncode(value ?: '')}</td>"
+}
+
+// Only OUI prefixes actually verified (via a public MAC vendor lookup) against
+// devices seen on this app's own test hub. Deliberately not a general-purpose OUI
+// database - unmatched addresses show blank rather than a guessed vendor name.
+@Field static final Map<String, String> KNOWN_MAC_VENDORS = [
+    'D073D5': 'LIFX (LiFi Labs)',
+    'C091B9': 'Amazon',
+    'E09D13': 'Samsung',
+    'C42996': 'Signify (Philips Hue)'
+]
+
+// Takes the leading brand-ish token off a human-assigned device name, e.g.
+// "Google_TV_Master_Bedroom" -> "Google", "LIFX_Entrance_Hall2" -> "LIFX". Falls back
+// to the full name if there's no separator to split on.
+String extractBrandFromName(String name) {
+    if (!name) return ''
+    def m = name =~ /^([A-Za-z]+)[-_ ]/
+    if (m.find()) return m.group(1)
+    return name
+}
+
+String lookupVendor(Map item) {
+    String mac = item?.macAddress?.toString()?.replaceAll(/[^A-Fa-f0-9]/, '')?.toUpperCase() ?: ''
+
+    if (mac.length() >= 6) {
+        String oui = mac.substring(0, 6)
+        if (KNOWN_MAC_VENDORS.containsKey(oui)) return KNOWN_MAC_VENDORS[oui]
+    }
+
+    // The "locally administered" bit (0x02) of the first octet being set means this
+    // OUI was never assigned to a manufacturer at all - e.g. Android/iOS per-network
+    // MAC randomization - so no OUI-based lookup could ever resolve a vendor here,
+    // known or not. In that case, trust a human-assigned device name (from the router
+    // client list or a matched Cast device) over guessing nothing - Gordon naming a
+    // device "Google_TV_Master_Bedroom" is more reliable than any MAC-based lookup
+    // could ever be for an address that was deliberately randomized for privacy.
+    Boolean isRandomised = false
+    try {
+        if (mac.length() >= 2) {
+            Integer firstByte = Integer.parseInt(mac.substring(0, 2), 16)
+            isRandomised = (firstByte & 0x02) != 0
+        }
+    } catch (Exception ignored) {}
+
+    if (isRandomised) {
+        String brand = extractBrandFromName(lookupKnownAs(item))
+        if (brand) return brand
+        return 'Randomized/local address'
+    }
+
+    return ''
+}
+
+// Hubitat's httpGet auto-parses the response differently by Content-Type (it already
+// hands back a parsed object for JSON, which is why the mDNS-fetch code above has to
+// special-case that). Hubitat's File Manager serves uploaded files as generic
+// application/octet-stream, which comes through as some stream-like object, not a
+// String - calling .toString() on that gives a Java object reference, not the file's
+// actual text. Hubitat's app sandbox also blocks direct references to java.io.* classes
+// (InputStream/Reader), so this can't type-check against them - it just tries the
+// dynamic getText() call any stream-like object supports, falling back to toString().
+String extractResponseText(Object data) {
+    if (data == null) return ''
+    if (data instanceof String) return data
+
+    try {
+        return data.getText('UTF-8')
+    } catch (Exception ignored) {
+        return data?.toString() ?: ''
+    }
+}
+
+List<String> parseCsvLine(String line) {
+    // Split on commas that are outside double-quoted fields, then strip the quotes.
+    List<String> fields = line.split(/,(?=(?:[^"]*"[^"]*")*[^"]*$)/) as List
+    return fields.collect { it?.trim()?.replaceAll(/^"|"$/, '') ?: '' }
+}
+
+Map parseRouterClientCsv(String csv) {
+    if (!csv?.trim()) return [:]
+
+    List<String> lines = csv.readLines().findAll { it?.trim() }
+    if (lines.size() < 2) return [:]
+
+    List<String> headers = parseCsvLine(lines[0]).collect { it.toLowerCase() }
+    Integer nameIdx = headers.findIndexOf { it.contains('client name') }
+    Integer macIdx = headers.findIndexOf { it.contains('mac address') }
+    if (nameIdx < 0 || macIdx < 0) return [:]
+
+    Map lookup = [:]
+    lines.drop(1).each { line ->
+        List<String> fields = parseCsvLine(line)
+        if (fields.size() <= Math.max(nameIdx, macIdx)) return
+
+        String mac = fields[macIdx]?.replaceAll(/[^A-Fa-f0-9]/, '')?.toUpperCase() ?: ''
+        String name = fields[nameIdx] ?: ''
+        if (mac.length() == 12 && name) lookup[mac] = name
+    }
+
+    return lookup
+}
+
+// Fetches the router client list CSV from the configured URL and caches the parsed
+// MAC -> device-name lookup in state. Runs once per discovery, same cadence as the
+// mDNS cache fetch. Any failure (unreachable URL, bad CSV, no header match) logs a
+// warning and leaves the previous cached lookup in place rather than wiping it out.
+void fetchRouterClientNames() {
+    String url = routerClientListUrl?.toString()?.trim() ?: ''
+    if (!url) {
+        state.routerDeviceNames = [:]
+        return
+    }
+
+    try {
+        httpGet([uri: url, timeout: 15]) { resp ->
+            Integer status = safeInt(resp?.status)
+            if (status < 200 || status >= 300) {
+                log.warn "Router client list fetch failed: HTTP ${status}. Keeping previous data."
+                return
+            }
+
+            Map parsed = parseRouterClientCsv(extractResponseText(resp?.data))
+            if (parsed) {
+                state.routerDeviceNames = parsed
+            } else {
+                log.warn 'Router client list fetch succeeded but no rows were parsed - check the CSV has "Client Name" and "Clients MAC Address" headers. Keeping previous data.'
+            }
+        }
+    } catch (Exception e) {
+        log.warn "Router client list fetch error: ${e.message}. Keeping previous data."
+    }
+}
+
+// Matter/Hue mDNS records carry no human-friendly name of their own. This first checks
+// the router client list fetched above (covers virtually every device on the LAN), then
+// falls back to matching against the currently-discovered Cast device list by MAC/IP -
+// e.g. an Android TV's Matter helper service sharing its Cast identity - for anyone who
+// hasn't configured the router URL.
+String lookupKnownAs(Map item) {
+    String rawMac = item?.macAddress?.toString() ?: ''
+    String normalisedMac = rawMac.replaceAll(/[^A-Fa-f0-9]/, '')?.toUpperCase() ?: ''
+
+    Map routerNames = state.routerDeviceNames instanceof Map ? state.routerDeviceNames : [:]
+    if (normalisedMac && routerNames.containsKey(normalisedMac)) return routerNames[normalisedMac]
+
+    Map cast = state.currentDevices instanceof Map ? state.currentDevices : [:]
+    String ip = item?.ip?.toString() ?: ''
+
+    if (rawMac) {
+        Map match = cast.values().find { it instanceof Map && it.macAddress?.toString() == rawMac }
+        if (match) return match.name?.toString() ?: ''
+    }
+
+    if (ip) {
+        Map match = cast.values().find { it instanceof Map && it.ip?.toString() == ip }
+        if (match) return match.name?.toString() ?: ''
+    }
+
+    return ''
+}
+
+List<Integer> getSimpleTableColumnWidths(List<Map> deviceMaps) {
+    List<Integer> widths = [26, 22, 13, 7, 14, 20, 22, 17]
+
+    Closure addItem = { Map item ->
+        if (!item) return
+
+        List values = [
+            item.name ?: '',
+            item.host ?: '',
+            item.ip ?: '',
+            item.port ?: '',
+            item.macAddress ?: '',
+            lookupVendor(item),
+            lookupKnownAs(item),
+            displayTimestamp(item.lastSeen ?: item.lastUpdated ?: item.lastActiveAt ?: item.discoveredAt ?: '')
+        ]
+
+        values.eachWithIndex { value, Integer idx ->
+            Integer len = value?.toString()?.length() ?: 0
+            // +4 rather than +2: Matter's fixed 33-char fabricId-nodeId names are
+            // dominated by uppercase hex (A-F), which renders wider than the digit
+            // glyph that defines 1ch in Hubitat's proportional UI font, and this also
+            // needs to absorb the cell's own 18px right-padding (roughly 2-3ch).
+            widths[idx] = Math.max(widths[idx], Math.min(len + 4, getSimpleMaxColumnWidth(idx)))
+        }
+    }
+
+    (deviceMaps ?: []).each { m -> (m ?: [:]).each { key, item -> addItem(item as Map) } }
+
+    return widths
+}
+
+// Hue and Matter are rendered as separate <table> elements, so widths must be
+// computed from BOTH sections together - otherwise each table sizes its Name/Host
+// columns only against its own rows, and the two sections drift out of alignment
+// with each other (e.g. Matter's much longer names widen its columns but not Hue's).
+List<Integer> getSharedSimpleTableColumnWidths() {
+    Map hueCurrent = state.currentHueDevices instanceof Map ? state.currentHueDevices : [:]
+    Map huePrevious = getPreviouslyDiscoveredHue()
+    Map matterCurrent = state.currentMatterDevices instanceof Map ? state.currentMatterDevices : [:]
+    Map matterPrevious = getPreviouslyDiscoveredMatter()
+
+    return getSimpleTableColumnWidths([hueCurrent, huePrevious, matterCurrent, matterPrevious])
+}
+
+Integer getSimpleMaxColumnWidth(Integer idx) {
+    List<Integer> maxes = [40, 32, 15, 8, 18, 30, 30, 18]
+    return maxes[idx]
+}
+
+String buildSimpleColgroupHtml(List<Integer> widths) {
+    StringBuilder b = new StringBuilder()
+    b << '<colgroup>'
+    (widths ?: [26, 22, 13, 7, 14, 20, 22, 17]).each { Integer w ->
+        b << "<col style='width:${w}ch;'>"
+    }
+    b << '</colgroup>'
+    return b.toString()
+}
+
+String buildSimpleTable(Map devices, Boolean faded, List<Integer> widths) {
+    String colour = faded ? 'color:#888888;' : ''
+    StringBuilder b = new StringBuilder()
+
+    // See buildTable() - same horizontal-scroll wrapper needed for mobile.
+    b << "<div style='overflow-x:auto;-webkit-overflow-scrolling:touch;width:100%;'>"
+    b << "<table style='font-size:13px;border-collapse:collapse;table-layout:fixed;width:auto;white-space:nowrap;${colour}'>"
+    b << buildSimpleColgroupHtml(widths)
+    b << "<tr style='${colour}'><th align='left'>Name</th><th align='left'>Host</th><th align='left'>IP</th><th align='left'>Port</th><th align='left'>MAC</th><th align='left'>Vendor</th><th align='left'>Known As</th><th align='left'>Last seen</th></tr>"
+
+    devices.sort { a, c -> compareIpAddress(a.value.ip?.toString(), c.value.ip?.toString()) ?: (a.value.name <=> c.value.name) }.each { key, item ->
+        b << '<tr>'
+        b << deviceCell(item.name ?: '')
+        b << deviceCell(item.host ?: '')
+        b << deviceCell(item.ip ?: '')
+        b << deviceCell(item.port ?: '')
+        b << deviceCell(item.macAddress ?: '')
+        b << deviceCell(lookupVendor(item))
+        b << deviceCell(lookupKnownAs(item))
+        b << deviceCell(displayTimestamp(item.lastSeen ?: item.lastUpdated ?: item.lastActiveAt ?: item.discoveredAt ?: ''))
+        b << '</tr>'
+    }
+
+    b << '</table>'
+    b << '</div>'
+    return b.toString()
+}
+
+String buildSimpleDeviceSectionHtml(Map current, Map previous, String label, List<Integer> widths) {
+    if (!current && !previous) {
+        return "No ${label} mDNS records discovered yet."
+    }
+
+    StringBuilder b = new StringBuilder()
+
+    if (current) {
+        b << "<p><b>Current ${label}s: ${current.size()}</b></p>"
+        b << buildSimpleTable(current, false, widths)
+    } else {
+        b << "<p><b>Current ${label}s: 0</b></p>"
+    }
+
+    if (previous) {
+        b << "<p style='margin-top:14px;color:#888888;'><b>Previously discovered - retained for ${clampInt(safeInt(previousRetentionDays ?: 7), 1, 365)} day(s)</b></p>"
+        b << buildSimpleTable(previous, true, widths)
+    }
+
+    return b.toString()
+}
+
+String buildHueTableHtml() {
+    Map current = state.currentHueDevices instanceof Map ? state.currentHueDevices : [:]
+    Map previous = getPreviouslyDiscoveredHue()
+    return buildSimpleDeviceSectionHtml(current, previous, 'Hue bridge', getSharedSimpleTableColumnWidths())
+}
+
+String buildMatterTableHtml() {
+    Map current = state.currentMatterDevices instanceof Map ? state.currentMatterDevices : [:]
+    Map previous = getPreviouslyDiscoveredMatter()
+    return buildSimpleDeviceSectionHtml(current, previous, 'Matter device', getSharedSimpleTableColumnWidths())
 }
 
 String buildSourceHtml() {

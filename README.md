@@ -223,4 +223,4 @@ This app is local-network discovery tooling only. It does not authenticate to Go
 
 ## License
 
-MIT License suggested, unless you choose a different license for the repository.
+Apache License 2.0 - see [LICENSE](LICENSE).
